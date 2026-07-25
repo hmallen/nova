@@ -59,6 +59,36 @@ function savePrefs() {
   localStorage.setItem("nova.prefs", JSON.stringify(state.prefs));
 }
 
+// ---------- Routines (Plan 4) ----------
+// Steps are a tool-name string (no args) or { tool, args }. Only
+// no-interaction tools are legal, so a routine can never sit waiting on a
+// geolocation prompt or set a surprise alarm.
+const ROUTINE_ALLOWED_TOOLS = [
+  "get_weather", "get_news", "daily_summary", "play_ambient_sound",
+  "control_device", "manage_list", // manage_list is forced to action:"read"
+];
+
+const DEFAULT_ROUTINES = {
+  "good morning": ["get_weather", "daily_summary", "get_news"],
+  "good night": ["daily_summary", { tool: "play_ambient_sound", args: { sound: "rain" } }],
+};
+
+state.routines = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem("nova.routines") || "null");
+    if (saved && typeof saved === "object") return saved;
+  } catch {}
+  return JSON.parse(JSON.stringify(DEFAULT_ROUTINES)); // seed on first load
+})();
+
+function saveRoutines() {
+  localStorage.setItem("nova.routines", JSON.stringify(state.routines));
+}
+
+function routineStepNames(steps) {
+  return steps.map(s => (typeof s === "string" ? s : s.tool));
+}
+
 // Shared by get_weather and manage_preferences (home city is geocoded once,
 // at set time, so weather lookups skip the round-trip later).
 async function geocodeCity(location) {
@@ -214,6 +244,54 @@ const TOOLS = [
     name: "stop_ambient_sound",
     description: "Stop any playing ambient sound.",
     parameters: { type: "object", properties: {}, required: [] },
+  },
+  {
+    type: "function",
+    name: "get_news",
+    description: "Get current news headlines, optionally about a topic. Read 3-5 of them " +
+      "as a brief spoken news update, paraphrasing naturally — do not read URLs or bylines.",
+    parameters: {
+      type: "object",
+      properties: {
+        topic: { type: "string", description: "Optional topic, e.g. 'technology', 'Portland'" },
+      },
+      required: [],
+    },
+  },
+  {
+    type: "function",
+    name: "daily_summary",
+    description: "Get today's schedule: running timers, today's alarms, and reminders due today. " +
+      "Use when the user asks what their day looks like.",
+    parameters: { type: "object", properties: {}, required: [] },
+  },
+  {
+    type: "function",
+    name: "run_routine",
+    description: "Run a named routine (a saved sequence of skills). Available routines are " +
+      "in the result of manage_routine get. When the user says 'good morning' or 'good night', " +
+      "run the matching routine and weave the results into ONE natural spoken update.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    type: "function",
+    name: "manage_routine",
+    description: "List saved routines, create or delete one, or add/remove a skill step by tool name.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["get", "add_step", "remove_step", "create", "delete"] },
+        name: { type: "string", description: "Routine name, e.g. 'good morning'" },
+        step_tool: { type: "string", description: "Tool name for add_step/remove_step, e.g. 'get_news'" },
+      },
+      required: ["action"],
+    },
   },
   {
     type: "function",
@@ -450,6 +528,112 @@ const toolHandlers = {
   async stop_ambient_sound() {
     stopAmbient();
     return { ok: true };
+  },
+
+  async get_news({ topic }) {
+    try {
+      const resp = await fetch("/api/news" + (topic ? `?topic=${encodeURIComponent(topic)}` : ""));
+      const body = await resp.json();
+      if (!resp.ok) return { error: body.error || "Couldn't fetch the news right now." };
+      return { headlines: body.headlines };
+    } catch {
+      return { error: "Couldn't fetch the news right now." };
+    }
+  },
+
+  async daily_summary() {
+    const now = new Date();
+    const spokenTime = (hhmm) => {
+      const [h, m] = hhmm.split(":").map(Number);
+      return new Date(2000, 0, 1, h, m).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    };
+    const timers = state.timers
+      .filter(t => !t.done)
+      .slice(0, 5)
+      .map(t => ({ label: t.label, remaining_minutes: Math.max(1, Math.round((t.endsAt - Date.now()) / 60000)) }));
+    const alarms = state.alarms
+      .filter(a => (a.days ? a.days.includes(now.getDay()) : !a.done))
+      .slice(0, 5)
+      .map(a => ({ label: a.label, time: spokenTime(a.time), repeats: a.days ? formatDays(a.days) : "one-time" }));
+    const reminders = state.reminders
+      .filter(r => !r.done && new Date(r.at).toDateString() === now.toDateString())
+      .slice(0, 5)
+      .map(r => ({ text: r.text, due: formatDueTime(r.at) }));
+    return { timers, alarms, reminders };
+  },
+
+  async run_routine({ name }) {
+    const wanted = String(name || "").toLowerCase().trim();
+    const key = Object.keys(state.routines).find(k => k.toLowerCase() === wanted);
+    if (!key) {
+      return { error: `No routine called "${name}". Available: ${Object.keys(state.routines).join(", ") || "none"}.` };
+    }
+    // Steps run sequentially via the handlers directly (not new function-call
+    // rounds): one function_call_output carries the composite result, so the
+    // whole morning update costs a single model round-trip.
+    const results = [];
+    for (const step of state.routines[key]) {
+      const tool = typeof step === "string" ? step : step?.tool;
+      let args = (typeof step === "object" && step?.args) || {};
+      if (tool === "manage_list") args = { ...args, action: "read" };
+      if (!ROUTINE_ALLOWED_TOOLS.includes(tool)) {
+        results.push({ step: String(tool), error: "This skill isn't allowed in routines." });
+        continue;
+      }
+      try {
+        results.push({ step: tool, result: await toolHandlers[tool](args) });
+      } catch (err) {
+        results.push({ step: tool, error: String(err.message || err) });
+      }
+    }
+    return { routine: key, results };
+  },
+
+  async manage_routine({ action, name, step_tool }) {
+    const routines = state.routines;
+    const key = name
+      ? Object.keys(routines).find(k => k.toLowerCase() === name.toLowerCase().trim())
+      : null;
+    switch (action) {
+      case "get":
+        return {
+          routines: Object.fromEntries(
+            Object.entries(routines).map(([n, steps]) => [n, routineStepNames(steps)])
+          ),
+        };
+      case "create": {
+        if (!name) return { error: "Routine name required." };
+        if (key) return { error: `Routine "${key}" already exists.` };
+        routines[name.toLowerCase().trim()] = [];
+        saveRoutines();
+        return { ok: true, created: name.toLowerCase().trim() };
+      }
+      case "delete": {
+        if (!key) return { error: `No routine called "${name}".` };
+        delete routines[key];
+        saveRoutines();
+        return { ok: true, deleted: key };
+      }
+      case "add_step": {
+        if (!key) return { error: `No routine called "${name}".` };
+        if (!ROUTINE_ALLOWED_TOOLS.includes(step_tool)) {
+          return { error: `"${step_tool}" can't run in a routine. Allowed: ${ROUTINE_ALLOWED_TOOLS.join(", ")}.` };
+        }
+        routines[key].push(step_tool === "manage_list" ? { tool: "manage_list", args: { action: "read" } } : step_tool);
+        saveRoutines();
+        return { ok: true, routine: key, steps: routineStepNames(routines[key]) };
+      }
+      case "remove_step": {
+        if (!key) return { error: `No routine called "${name}".` };
+        const idx = routines[key].findIndex(s => (typeof s === "string" ? s : s?.tool) === step_tool);
+        if (idx === -1) return { error: `"${step_tool}" is not in the ${key} routine.` };
+        routines[key].splice(idx, 1);
+        saveRoutines();
+        return { ok: true, routine: key, steps: routineStepNames(routines[key]) };
+      }
+      default:
+        return { error: "Unknown action." };
+    }
   },
 
   async manage_preferences({ action, name, home_city, units, voice }) {

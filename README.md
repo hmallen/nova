@@ -30,6 +30,11 @@ Try:
 - "Turn on the living room light" · "Turn off all the lights" · "Set the thermostat to 72"
 - "Play rain sounds" / "Play ocean sounds" · "Stop"
 - "Turn the volume down"
+- "Good morning" — runs a routine: weather, today's schedule, and a short
+  news briefing as one flowing update ("Good night" ends with rain sounds)
+- "What's in the news?" · "Any news about space?" — keyless RSS headlines
+- "What does my day look like?" — timers, today's alarms, reminders due today
+- "Add the news to my good night routine" · "What are my routines?"
 - "Remember that I live in Portland" · "Call me Sam" · "Use celsius" —
   preferences persist and are honored next session ("What do you know about me?")
 - "Change your voice to cedar" — takes effect on the next session
@@ -67,6 +72,12 @@ Browser ──(mic audio via WebRTC)──────────► OpenAI Rea
   (rain / white noise / ocean, synthesized with Web Audio), `stop_ambient_sound`,
   `set_volume`, `manage_preferences`. Device states, preferences, and
   timers/alarms/reminders persist in `localStorage`.
+- **Routines** — saved skill sequences in `localStorage` (seeded with
+  "good morning" and "good night"), editable by voice via `manage_routine`.
+  `run_routine` executes the steps locally and returns one composite result,
+  so the whole morning update costs a single model round-trip. Only
+  non-interactive skills are allowed as steps. News comes from a server-side
+  RSS proxy (`GET /api/news`, Google News by default, 10-minute cache).
 - **Lists are shared across devices** — stored server-side in `data/state.json`
   behind `GET/PUT /api/lists` and polled every 4 s by visible clients, so the
   item a phone adds shows up on the kitchen tablet within seconds. Edits made

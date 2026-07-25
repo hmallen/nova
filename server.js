@@ -14,6 +14,7 @@ import { existsSync, readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createStore } from "./lib/store.js";
+import { parseRss } from "./lib/rss.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -77,6 +78,11 @@ function names — you are simply Nova.
 If the user tells you something to remember about themselves (their name, home
 city, temperature units, or which voice to use), call manage_preferences to
 save it — don't just acknowledge.
+
+When the user greets you with "good morning" or "good night", call run_routine
+with that name if it exists. Present routine results as one connected update,
+not a list of tool outputs: weather first, then today's schedule, then a few
+headlines. Keep the whole update under about thirty seconds of speech.
 `.trim();
 
 // Read a small JSON request body (also used by the list-sync endpoints).
@@ -109,6 +115,42 @@ function sanitizePrefs(raw) {
   if (raw.units === "fahrenheit" || raw.units === "celsius") prefs.units = raw.units;
   if (ALLOWED_VOICES.includes(raw.voice)) prefs.voice = raw.voice;
   return prefs;
+}
+
+// ---- News (Plan 4): keyless RSS proxy — browsers can't fetch cross-origin
+// RSS, so the server does, parses, and returns just speakable headlines. ----
+
+const NEWS_FEEDS = (process.env.NEWS_FEEDS || "https://news.google.com/rss")
+  .split(",").map(s => s.trim()).filter(Boolean);
+const NEWS_CACHE_MS = 10 * 60 * 1000;
+let newsCache = null; // { at, headlines } for the no-topic case only
+
+async function fetchHeadlines(topic) {
+  if (!topic && newsCache && Date.now() - newsCache.at < NEWS_CACHE_MS) {
+    return newsCache.headlines;
+  }
+  const urls = topic
+    ? [`https://news.google.com/rss/search?q=${encodeURIComponent(topic)}`]
+    : NEWS_FEEDS;
+  const items = [];
+  for (const url of urls) {
+    const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) throw new Error(`Feed returned HTTP ${resp.status}`);
+    items.push(...parseRss(await resp.text()));
+  }
+  // Dedupe near-identical titles (same story from several feeds/outlets).
+  const seen = new Set();
+  const headlines = [];
+  for (const item of items) {
+    const key = item.title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 60);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    headlines.push({ title: item.title, ...(item.source ? { source: item.source } : {}) });
+    if (headlines.length >= 8) break;
+  }
+  if (!headlines.length) throw new Error("No headlines found in feed");
+  if (!topic) newsCache = { at: Date.now(), headlines };
+  return headlines;
 }
 
 // Shape check for PUT /api/lists bodies: object of listName → string items,
@@ -193,6 +235,19 @@ const server = http.createServer(async (req, res) => {
         const secret = await mintClientSecret(prefs);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ value: secret.value, model: REALTIME_MODEL }));
+      } catch (err) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: String(err.message || err) }));
+      }
+      return;
+    }
+
+    if (req.method === "GET" && req.url.split("?")[0] === "/api/news") {
+      const topic = new URL(req.url, "http://x").searchParams.get("topic") || "";
+      try {
+        const headlines = await fetchHeadlines(topic.slice(0, 100));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ headlines }));
       } catch (err) {
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: String(err.message || err) }));
