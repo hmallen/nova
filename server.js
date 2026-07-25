@@ -34,6 +34,8 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // Override with REALTIME_MODEL=gpt-realtime-2.1-mini for lower cost/latency.
 const REALTIME_MODEL = process.env.REALTIME_MODEL || "gpt-realtime-2.1";
 const VOICE = process.env.REALTIME_VOICE || "marin";
+// Voices the client may request via saved preferences (mirrored in app.js).
+const ALLOWED_VOICES = ["marin", "cedar", "alloy"];
 
 const INSTRUCTIONS = `
 You are Nova, a friendly household voice assistant in the style of Amazon Alexa.
@@ -66,32 +68,76 @@ Capabilities:
 
 The user may address you as "Nova". Do not mention OpenAI, models, tools, or
 function names — you are simply Nova.
+
+If the user tells you something to remember about themselves (their name, home
+city, temperature units, or which voice to use), call manage_preferences to
+save it — don't just acknowledge.
 `.trim();
+
+// Read a small JSON request body (also used by the list-sync endpoints).
+function readBody(req, limit = 64 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > limit) {
+        reject(new Error("Body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+// Prefs arrive from the browser and get spliced into the system prompt —
+// treat as untrusted: allowlist enums, truncate free text, strip newlines.
+function sanitizePrefs(raw) {
+  const prefs = {};
+  if (!raw || typeof raw !== "object") return prefs;
+  const clean = (s) => String(s).replace(/[\r\n]+/g, " ").trim().slice(0, 60);
+  if (typeof raw.name === "string" && raw.name.trim()) prefs.name = clean(raw.name);
+  if (typeof raw.homeLabel === "string" && raw.homeLabel.trim()) prefs.homeLabel = clean(raw.homeLabel);
+  if (raw.units === "fahrenheit" || raw.units === "celsius") prefs.units = raw.units;
+  if (ALLOWED_VOICES.includes(raw.voice)) prefs.voice = raw.voice;
+  return prefs;
+}
 
 // Session template. Tool definitions live in the client (public/app.js)
 // alongside their implementations and are attached via session.update once the
 // data channel opens.
-function sessionConfig() {
+function sessionConfig(prefs = {}) {
+  let instructions = INSTRUCTIONS;
+  const about = [];
+  if (prefs.name) about.push(`- Name: ${prefs.name} — address them by name occasionally, not every turn.`);
+  if (prefs.homeLabel) about.push(`- Home: ${prefs.homeLabel} — assume this for weather and time-of-day context.`);
+  if (prefs.units) about.push(`- Units: ${prefs.units}.`);
+  if (about.length) {
+    instructions += `\n\nAbout this user (from saved preferences):\n${about.join("\n")}`;
+  }
   return {
     session: {
       type: "realtime",
       model: REALTIME_MODEL,
-      instructions: INSTRUCTIONS,
+      instructions,
       audio: {
-        output: { voice: VOICE },
+        output: { voice: prefs.voice || VOICE },
       },
     },
   };
 }
 
-async function mintClientSecret() {
+async function mintClientSecret(prefs) {
   const resp = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(sessionConfig()),
+    body: JSON.stringify(sessionConfig(prefs)),
   });
   const body = await resp.json().catch(() => ({}));
   if (!resp.ok) {
@@ -119,8 +165,13 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: "OPENAI_API_KEY is not set. Copy .env.example to .env and add your key." }));
         return;
       }
+      let prefs = {};
       try {
-        const secret = await mintClientSecret();
+        const body = await readBody(req);
+        prefs = sanitizePrefs(body ? JSON.parse(body).prefs : null);
+      } catch {} // absent/invalid body → default session
+      try {
+        const secret = await mintClientSecret(prefs);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ value: secret.value, model: REALTIME_MODEL }));
       } catch (err) {

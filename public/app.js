@@ -29,6 +29,14 @@ let connected = false;
 let assistantSpeaking = false;
 
 // ---------- Assistant state (the "skills") ----------
+const DEFAULT_PREFS = {
+  name: null,          // "Sam"
+  homeCity: null,      // "Portland" (as the user said it)
+  homeLat: null, homeLon: null, homeLabel: null, // resolved+cached geocode
+  units: "fahrenheit", // "fahrenheit" | "celsius"
+  voice: null,         // null = server default
+};
+
 const state = {
   timers: [],    // {id, kind:"timer",    label, endsAt, done}
   alarms: [],    // {id, kind:"alarm",    label, time:"HH:MM", days:[0..6]|null, done, lastFiredOn:"YYYY-MM-DD"|null}
@@ -42,7 +50,27 @@ const state = {
     "thermostat": { on: true, value: 70 },
   },
   volume: 8, // 0-10
+  prefs: { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem("nova.prefs") || "null") },
 };
+
+function savePrefs() {
+  localStorage.setItem("nova.prefs", JSON.stringify(state.prefs));
+}
+
+// Shared by get_weather and manage_preferences (home city is geocoded once,
+// at set time, so weather lookups skip the round-trip later).
+async function geocodeCity(location) {
+  const geo = await fetch(
+    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=en`
+  ).then(r => r.json()).catch(() => null);
+  const hit = geo?.results?.[0];
+  if (!hit) return null;
+  return {
+    lat: hit.latitude,
+    lon: hit.longitude,
+    label: [hit.name, hit.admin1, hit.country_code].filter(Boolean).join(", "),
+  };
+}
 
 // =====================================================================
 // Tool definitions (sent to the model) + implementations (run locally)
@@ -187,6 +215,24 @@ const TOOLS = [
   },
   {
     type: "function",
+    name: "manage_preferences",
+    description: "Read or update remembered user preferences: their name, home city, " +
+      "temperature units (fahrenheit/celsius), and Nova's voice. Use when the user says " +
+      "things like 'remember that…', 'call me…', 'I live in…', 'use celsius', 'change your voice'.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["get", "set", "clear"] },
+        name: { type: "string" },
+        home_city: { type: "string" },
+        units: { type: "string", enum: ["fahrenheit", "celsius"] },
+        voice: { type: "string", enum: ["marin", "cedar", "alloy"] }, // mirror server allowlist
+      },
+      required: ["action"],
+    },
+  },
+  {
+    type: "function",
     name: "set_volume",
     description: "Set the assistant's speaker volume from 0 (mute) to 10 (max), or adjust up/down.",
     parameters: {
@@ -316,13 +362,14 @@ const toolHandlers = {
   async get_weather({ location }) {
     let lat, lon, name;
     if (location) {
-      const geo = await fetch(
-        `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=en`
-      ).then(r => r.json());
-      const hit = geo?.results?.[0];
-      if (!hit) return { error: `Could not find a place called "${location}".` };
-      ({ latitude: lat, longitude: lon } = hit);
-      name = [hit.name, hit.admin1, hit.country_code].filter(Boolean).join(", ");
+      const place = await geocodeCity(location);
+      if (!place) return { error: `Could not find a place called "${location}".` };
+      ({ lat, lon } = place);
+      name = place.label;
+    } else if (state.prefs.homeLat != null && state.prefs.homeLon != null) {
+      lat = state.prefs.homeLat;
+      lon = state.prefs.homeLon;
+      name = state.prefs.homeLabel || "home";
     } else {
       try {
         const pos = await new Promise((res, rej) =>
@@ -335,23 +382,25 @@ const toolHandlers = {
         return { error: "Location permission denied — ask the user which city they want the weather for." };
       }
     }
+    const units = state.prefs.units === "celsius" ? "celsius" : "fahrenheit";
     const wx = await fetch(
       `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
       `&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m` +
       `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
-      `&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto&forecast_days=1`
+      `&temperature_unit=${units}&wind_speed_unit=mph&timezone=auto&forecast_days=1`
     ).then(r => r.json());
     const cur = wx.current;
     const daily = wx.daily;
     const summary = {
       location: name,
       conditions: describeWeatherCode(cur.weather_code),
-      temperature_f: Math.round(cur.temperature_2m),
-      feels_like_f: Math.round(cur.apparent_temperature),
+      units,
+      temperature: Math.round(cur.temperature_2m),
+      feels_like: Math.round(cur.apparent_temperature),
       humidity_pct: cur.relative_humidity_2m,
       wind_mph: Math.round(cur.wind_speed_10m),
-      today_high_f: Math.round(daily.temperature_2m_max[0]),
-      today_low_f: Math.round(daily.temperature_2m_min[0]),
+      today_high: Math.round(daily.temperature_2m_max[0]),
+      today_low: Math.round(daily.temperature_2m_min[0]),
       precipitation_chance_pct: daily.precipitation_probability_max[0],
     };
     renderWeather(summary);
@@ -420,6 +469,50 @@ const toolHandlers = {
     return { ok: true };
   },
 
+  async manage_preferences({ action, name, home_city, units, voice }) {
+    const speakable = () => ({
+      name: state.prefs.name,
+      home_city: state.prefs.homeLabel || state.prefs.homeCity,
+      units: state.prefs.units,
+      voice: state.prefs.voice || "default",
+    });
+    if (action === "get") return { prefs: speakable() };
+    if (action === "clear") {
+      state.prefs = { ...DEFAULT_PREFS };
+      savePrefs();
+      return { ok: true, cleared: true };
+    }
+    // action === "set": apply only the provided fields.
+    let changed = false;
+    let note;
+    if (typeof name === "string" && name.trim()) {
+      state.prefs.name = name.trim();
+      changed = true;
+    }
+    if (units === "fahrenheit" || units === "celsius") {
+      state.prefs.units = units;
+      changed = true;
+    }
+    if (typeof voice === "string" && voice) {
+      state.prefs.voice = voice;
+      changed = true;
+      // Voice is fixed once the model has spoken in a Realtime session.
+      note = "The new voice takes effect next session.";
+    }
+    if (typeof home_city === "string" && home_city.trim()) {
+      const place = await geocodeCity(home_city.trim());
+      if (!place) return { error: `I couldn't find a city called "${home_city}" — nothing was saved.` };
+      state.prefs.homeCity = home_city.trim();
+      state.prefs.homeLat = place.lat;
+      state.prefs.homeLon = place.lon;
+      state.prefs.homeLabel = place.label;
+      changed = true;
+    }
+    savePrefs();
+    if (!changed) return { prefs: speakable(), note: "nothing changed" };
+    return { ok: true, prefs: speakable(), ...(note ? { note } : {}) };
+  },
+
   async set_volume({ level, direction }) {
     if (direction === "up") state.volume = Math.min(10, state.volume + 2);
     else if (direction === "down") state.volume = Math.max(0, state.volume - 2);
@@ -437,8 +530,21 @@ const toolHandlers = {
 async function startSession() {
   setRingState("connecting", "Connecting…");
   try {
-    // 1. Ephemeral client secret from our server (real API key never reaches the browser)
-    const tokenResp = await fetch("/api/session", { method: "POST" });
+    // 1. Ephemeral client secret from our server (real API key never reaches
+    //    the browser). Saved prefs ride along so the server can splice an
+    //    "About this user" block into the instructions and pick the voice.
+    const tokenResp = await fetch("/api/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prefs: {
+          name: state.prefs.name,
+          homeLabel: state.prefs.homeLabel,
+          units: state.prefs.units,
+          voice: state.prefs.voice,
+        },
+      }),
+    });
     const tokenBody = await tokenResp.json();
     if (!tokenResp.ok) throw new Error(tokenBody.error || "Could not create session");
     const EPHEMERAL_KEY = tokenBody.value;
@@ -972,13 +1078,14 @@ function renderWeather(w) {
   const body = document.getElementById("weatherBody");
   card.hidden = false;
   body.innerHTML = "";
+  const unitLabel = w.units === "celsius" ? "°C" : "°F";
   const temp = document.createElement("div");
   temp.className = "temp";
-  temp.textContent = `${w.temperature_f}°F`;
+  temp.textContent = `${w.temperature}${unitLabel}`;
   const desc = document.createElement("div");
   desc.textContent = `${w.conditions} — ${w.location}`;
   const detail = document.createElement("div");
-  detail.textContent = `H ${w.today_high_f}° / L ${w.today_low_f}° · feels like ${w.feels_like_f}° · ${w.precipitation_chance_pct}% rain · wind ${w.wind_mph} mph`;
+  detail.textContent = `H ${w.today_high}° / L ${w.today_low}° · feels like ${w.feels_like}° · ${w.precipitation_chance_pct}% rain · wind ${w.wind_mph} mph`;
   body.append(temp, desc, detail);
 }
 

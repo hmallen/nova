@@ -30,6 +30,9 @@ Try:
 - "Turn on the living room light" · "Turn off all the lights" · "Set the thermostat to 72"
 - "Play rain sounds" / "Play ocean sounds" · "Stop"
 - "Turn the volume down"
+- "Remember that I live in Portland" · "Call me Sam" · "Use celsius" —
+  preferences persist and are honored next session ("What do you know about me?")
+- "Change your voice to cedar" — takes effect on the next session
 - "Tell me a joke" · "How many ounces in a cup?" — answered directly by the model
 
 Optionally click **Enable wake word** to say "Nova" hands-free to start a
@@ -115,5 +118,7 @@ Sources:
 - The wake word runs on-device via the Web Speech API (Chrome/Edge) and only
   *starts* a session; keeping a Realtime session always-on just to detect a
   wake word would stream audio (and billing) continuously.
+- Preferences (name, home city, units, voice) are a single per-browser profile —
+  multiple people sharing one browser share one set of preferences.
 - Realtime audio is billed per audio token; use `REALTIME_MODEL=gpt-realtime-2.1-mini`
   in `.env` for cheaper experimentation.
