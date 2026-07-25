@@ -28,7 +28,8 @@ Try:
 - "What's the weather in Seattle?" (or just "What's the weather?" with location permission)
 - "Add milk and eggs to my shopping list" · "What's on my shopping list?"
 - "Turn on the living room light" · "Turn off all the lights" · "Set the thermostat to 72"
-- "Play rain sounds" / "Play ocean sounds" · "Stop"
+- "Play rain sounds" / "Play ocean sounds" · "Play some jazz" (internet radio) · "Stop"
+- "What's on my calendar today?" (with `ICS_URL` configured)
 - "Turn the volume down"
 - "Good morning" — runs a routine: weather, today's schedule, and a short
   news briefing as one flowing update ("Good night" ends with rain sounds)
@@ -93,6 +94,47 @@ Browser ──(mic audio via WebRTC)──────────► OpenAI Rea
   reminders as "This is your reminder to …". They survive page refreshes;
   reminders that come due while the page is closed show as "missed" and are
   announced once at the start of the next session.
+
+## Real integrations (all optional, env-gated)
+
+Nova runs fully simulated out of the box; each of these graduates a
+capability into a real one when its env vars are set. Secrets stay in `.env`
+and are only used inside `server.js` proxy endpoints — the browser never sees
+them. The client asks `GET /api/config` at boot which integrations are live
+and only registers the matching tools.
+
+### Home Assistant
+
+Set `HA_URL` and `HA_TOKEN` (a long-lived access token from your HA profile
+page). `control_device` then drives real `light` / `switch` / `fan` /
+`climate` entities by friendly name ("turn on the office light", "set the
+thermostat to 21"), the Smart Home card mirrors real states (refreshed every
+30 s), and the server proxy validates every call hard — domains, services,
+entity ids, and data are allowlisted, so the browser can never use the
+full-admin token as a generic passthrough. Light brightness is out of scope
+for now: Nova says she can only switch lights on and off. Without the env
+vars, devices stay simulated exactly as before.
+
+### Calendar (read-only ICS)
+
+Set `ICS_URL` to a private iCal feed URL (Google: calendar settings → "Secret
+address in iCal format"; Outlook: "Publish calendar" ICS link; iCloud: public
+calendar link). "What's on my calendar today?" reads upcoming events with a
+hand-rolled RFC 5545 parser supporting TZID zones, all-day events, and
+daily/weekly RRULEs (weekly meetings — the 90% case). Other recurrence forms
+are skipped and Nova mentions some repeating events couldn't be read. The
+feed is cached for 15 minutes. When configured, the "good morning" routine
+gains a calendar step automatically.
+
+### Internet radio
+
+"Play some jazz" streams internet radio (defaults: a few
+[SomaFM](https://somafm.com) channels — listener-supported, commercial-free;
+please support them if you listen a lot). Nova's replies duck the music to
+25% volume while she speaks, like a real smart speaker. Override or extend
+the streams with the `RADIO_STREAMS` env var; names appear in the tool enum,
+URLs stay server-side behind a `302` redirect at `/api/radio/<name>`.
+"Play rain sounds" still uses the Web Audio synthesizer.
 
 ## Use it on a tablet or phone
 
@@ -167,8 +209,8 @@ Sources:
 
 - Weather uses the free, keyless [Open-Meteo](https://open-meteo.com) API;
   everything AI is OpenAI.
-- Smart-home devices are simulated (state shown in the UI) — swap the
-  `control_device` handler for real Home Assistant / Hue calls to go live.
+- Smart-home devices are simulated by default — set `HA_URL`/`HA_TOKEN` to
+  drive real Home Assistant devices (see "Real integrations").
 - The wake word runs on-device via the Web Speech API (Chrome/Edge) and only
   *starts* a session; keeping a Realtime session always-on just to detect a
   wake word would stream audio (and billing) continuously.

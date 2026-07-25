@@ -113,11 +113,40 @@ async function geocodeCity(location) {
   };
 }
 
+// ---------- Integration config (Plan 7) ----------
+// Fetched once at boot, before any session starts: the model should only be
+// told about devices/calendar/radio that actually exist.
+let appConfig = { homeAssistant: false, calendar: false, radio: [] };
+const configReady = fetch("/api/config")
+  .then(r => (r.ok ? r.json() : appConfig))
+  .then(c => {
+    appConfig = { homeAssistant: false, calendar: false, radio: [], ...c };
+    if (appConfig.homeAssistant) initHaDevices();
+    if (appConfig.calendar) {
+      ROUTINE_ALLOWED_TOOLS.push("get_calendar");
+      // The default morning routine gains the calendar when one exists.
+      const morning = state.routines["good morning"];
+      if (Array.isArray(morning) && !routineStepNames(morning).includes("get_calendar")) {
+        morning.push("get_calendar");
+        saveRoutines();
+      }
+    }
+  })
+  .catch(() => {});
+
+function radioNames() {
+  return (appConfig.radio || []).map(r => r.name);
+}
+
 // =====================================================================
 // Tool definitions (sent to the model) + implementations (run locally)
 // =====================================================================
 
-const TOOLS = [
+// Built per-session (not a const): descriptions embed the real device names
+// and the available radio streams, and get_calendar only registers when an
+// ICS feed is configured.
+function buildTools() {
+  const tools = [
   {
     type: "function",
     name: "get_current_datetime",
@@ -225,13 +254,16 @@ const TOOLS = [
   {
     type: "function",
     name: "control_device",
-    description: "Control a simulated smart-home device. Devices: living room light, bedroom light, kitchen light, fan, thermostat.",
+    description: (appConfig.homeAssistant
+      ? "Control a smart-home device via Home Assistant."
+      : "Control a simulated smart-home device.") +
+      " Devices: " + Object.keys(state.devices).join(", ") + ".",
     parameters: {
       type: "object",
       properties: {
         device: { type: "string", description: "Device name, or 'all lights'" },
         action: { type: "string", enum: ["on", "off", "set"] },
-        value: { type: "number", description: "For thermostat 'set': temperature in °F" },
+        value: { type: "number", description: "For thermostat 'set': target temperature" },
       },
       required: ["device", "action"],
     },
@@ -239,11 +271,15 @@ const TOOLS = [
   {
     type: "function",
     name: "play_ambient_sound",
-    description: "Play a synthesized ambient sound. Options: rain, white noise, ocean. Use when the user asks for music, sleep sounds, or background noise.",
+    description: "Play a synthesized ambient sound (rain, white noise, ocean)" +
+      (radioNames().length
+        ? ` or an internet radio stream (${radioNames().join(", ")}). Use radio when the user asks for music or a genre`
+        : "") +
+      ". Use when the user asks for music, sleep sounds, or background noise.",
     parameters: {
       type: "object",
       properties: {
-        sound: { type: "string", enum: ["rain", "white noise", "ocean"] },
+        sound: { type: "string", enum: ["rain", "white noise", "ocean", ...radioNames()] },
       },
       required: ["sound"],
     },
@@ -333,7 +369,23 @@ const TOOLS = [
       required: [],
     },
   },
-];
+  ];
+  if (appConfig.calendar) {
+    tools.push({
+      type: "function",
+      name: "get_calendar",
+      description: "Get the user's calendar events for today or the next few days.",
+      parameters: {
+        type: "object",
+        properties: {
+          days: { type: "number", description: "1=today (default), up to 7" },
+        },
+        required: [],
+      },
+    });
+  }
+  return tools;
+}
 
 const toolHandlers = {
   async get_current_datetime() {
@@ -512,12 +564,44 @@ const toolHandlers = {
     const d = (device || "").toLowerCase();
     const targets = [];
     if (d === "all lights" || d === "the lights" || d === "lights") {
-      for (const name of Object.keys(state.devices)) if (name.includes("light")) targets.push(name);
+      for (const [name, dev] of Object.entries(state.devices)) {
+        if (appConfig.homeAssistant ? dev.domain === "light" : name.includes("light")) targets.push(name);
+      }
     } else {
-      const match = Object.keys(state.devices).find(name => name.includes(d) || d.includes(name));
-      if (match) targets.push(match);
+      // Duplicate friendly names match together and are acted on together —
+      // that's the "all lights" semantics users expect.
+      for (const name of Object.keys(state.devices)) {
+        if (name.includes(d) || d.includes(name)) targets.push(name);
+      }
     }
     if (!targets.length) return { error: `No device called "${device}". Devices: ${Object.keys(state.devices).join(", ")}.` };
+
+    if (appConfig.homeAssistant) {
+      for (const name of targets) {
+        const dev = state.devices[name];
+        let call;
+        if (action === "on") call = { domain: dev.domain, service: "turn_on", entity_id: dev.entity_id };
+        else if (action === "off") call = { domain: dev.domain, service: "turn_off", entity_id: dev.entity_id };
+        else if (action === "set" && typeof value === "number") {
+          if (dev.domain !== "climate") return { error: "I can only turn lights on and off for now." };
+          call = { domain: "climate", service: "set_temperature", entity_id: dev.entity_id, data: { temperature: value } };
+        } else {
+          return { error: "Unsupported action for that device." };
+        }
+        const resp = await fetch("/api/ha/call", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(call),
+        }).catch(() => null);
+        // No silent simulated fallback — lying about real devices is worse
+        // than failing.
+        if (!resp || !resp.ok) return { error: "I couldn't reach the smart home hub." };
+      }
+      // HA is authoritative; don't trust optimistic state.
+      await refreshHaStates().catch(() => {});
+      return { ok: true, devices: targets, action, value };
+    }
+
     for (const name of targets) {
       const dev = state.devices[name];
       if (action === "on") dev.on = true;
@@ -530,12 +614,20 @@ const toolHandlers = {
   },
 
   async play_ambient_sound({ sound }) {
-    startAmbient(sound);
-    return { ok: true, playing: sound };
+    const name = (sound || "").toLowerCase();
+    if (radioNames().includes(name)) {
+      stopAmbient(); // radio and synthesized sounds are mutually exclusive
+      startRadio(name);
+      return { ok: true, playing: name, kind: "radio stream" };
+    }
+    stopRadio();
+    startAmbient(name);
+    return { ok: true, playing: name };
   },
 
   async stop_ambient_sound() {
     stopAmbient();
+    stopRadio();
     return { ok: true };
   },
 
@@ -547,6 +639,27 @@ const toolHandlers = {
       return { headlines: body.headlines };
     } catch {
       return { error: "Couldn't fetch the news right now." };
+    }
+  },
+
+  async get_calendar({ days }) {
+    const n = Math.min(7, Math.max(1, Math.round(days || 1)));
+    try {
+      const resp = await fetch(`/api/calendar?days=${n}`);
+      const body = await resp.json();
+      if (!resp.ok) return { error: body.error || "Couldn't read the calendar right now." };
+      // Speak times, not ISO strings — keep the model away from raw dates.
+      const events = body.events.map(e => {
+        const start = new Date(e.start_iso);
+        const day = start.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+        return {
+          summary: e.summary,
+          when: e.all_day ? `${day} (all day)` : `${day} at ${start.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`,
+        };
+      });
+      return { events, ...(body.note ? { note: body.note } : {}) };
+    } catch {
+      return { error: "Couldn't read the calendar right now." };
     }
   },
 
@@ -694,10 +807,38 @@ const toolHandlers = {
     else if (direction === "down") state.volume = Math.max(0, state.volume - 2);
     else if (typeof level === "number") state.volume = Math.max(0, Math.min(10, level));
     assistantAudio.volume = state.volume / 10;
-    if (ambientGain) ambientGain.gain.value = 0.12 * (state.volume / 10);
+    applyDucking(); // also scales radio + ambient to the new volume
     return { ok: true, volume: state.volume };
   },
 };
+
+// =====================================================================
+// Home Assistant devices (Plan 7)
+// =====================================================================
+
+async function refreshHaStates() {
+  const resp = await fetch("/api/ha/states");
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const entities = await resp.json();
+  const devices = {};
+  for (const e of entities) {
+    devices[String(e.name).toLowerCase()] = {
+      entity_id: e.entity_id,
+      domain: e.domain,
+      on: e.state !== "off" && e.state !== "unavailable" && e.state !== "unknown",
+      ...(typeof e.temp === "number" ? { value: e.temp } : {}),
+    };
+  }
+  state.devices = devices; // real states replace the simulated set entirely
+  renderDevices();
+}
+
+function initHaDevices() {
+  refreshHaStates().catch(() => {});
+  setInterval(() => {
+    if (document.visibilityState === "visible") refreshHaStates().catch(() => {});
+  }, 30000);
+}
 
 // =====================================================================
 // Shared lists: server sync (Plan 3)
@@ -974,17 +1115,18 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(fire, delay);
 }
 
-function onDataChannelOpen() {
+async function onDataChannelOpen() {
   // Reset the reconnect budget only now — resetting in startSession's happy
   // path would let a mint-token failure loop spin forever.
   reconnectAttempts = 0;
   setRingState("listening", "Listening — just talk");
+  await configReady; // tool list depends on which integrations are live
   // Register tools + tuned audio settings now that the channel is live.
   sendEvent({
     type: "session.update",
     session: {
       type: "realtime",
-      tools: TOOLS,
+      tools: buildTools(),
       tool_choice: "auto",
       audio: {
         input: {
@@ -1125,12 +1267,14 @@ function handleServerEvent(evt) {
 
     case "output_audio_buffer.started":
       assistantSpeaking = true;
+      applyDucking();
       setRingState("speaking", "Speaking…");
       break;
 
     case "output_audio_buffer.stopped":
     case "output_audio_buffer.cleared":
       assistantSpeaking = false;
+      applyDucking();
       if (connected) setRingState("listening", "Listening — just talk");
       break;
 
@@ -1337,7 +1481,7 @@ function startAmbient(kind) {
   ambientNode.buffer = buffer;
   ambientNode.loop = true;
   ambientGain = c.createGain();
-  ambientGain.gain.value = 0.12 * (state.volume / 10);
+  ambientGain.gain.value = 0.12 * (state.volume / 10) * (assistantSpeaking ? 0.25 : 1);
 
   let chainIn = ambientNode;
   if (kind === "rain") {
@@ -1370,6 +1514,58 @@ function stopAmbient() {
   try { ambientLfo?.stop(); } catch {}
   ambientNode = ambientGain = ambientLfo = null;
 }
+
+// ---------- Internet radio (Plan 7) ----------
+// Stream URLs stay server-side: the client just points the audio element at
+// /api/radio/<name> and the server 302s to the real stream.
+
+const radioAudio = document.getElementById("radioAudio");
+let radioPlaying = null; // stream name while playing
+
+function startRadio(name) {
+  radioPlaying = name;
+  radioAudio.src = "/api/radio/" + encodeURIComponent(name);
+  applyDucking();
+  radioAudio.play().catch(() => {});
+}
+
+function stopRadio() {
+  if (!radioPlaying && !radioAudio.src) return;
+  radioPlaying = null;
+  try { radioAudio.pause(); } catch {}
+  radioAudio.removeAttribute("src");
+  radioAudio.load();
+}
+
+// While Nova is speaking, background audio drops to 25% — talking over
+// music should feel like it does on a real smart speaker.
+function applyDucking() {
+  const duck = assistantSpeaking ? 0.25 : 1;
+  radioAudio.volume = (state.volume / 10) * duck;
+  if (ambientGain) ambientGain.gain.value = 0.12 * (state.volume / 10) * duck;
+}
+
+// play() resolves before a stream 404/geo-block surfaces, so failures arrive
+// here — inject a system event the same way timers do.
+radioAudio.addEventListener("error", () => {
+  if (!radioPlaying) return;
+  const failed = radioPlaying;
+  stopRadio();
+  if (connected) {
+    sendEvent({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [{
+          type: "input_text",
+          text: `[system event] The "${failed}" radio stream failed to play. Tell the user briefly and offer a synthesized sound instead.`,
+        }],
+      },
+    });
+    sendEvent({ type: "response.create" });
+  }
+});
 
 // =====================================================================
 // Wake word ("Nova") — on-device browser speech recognition, used only to

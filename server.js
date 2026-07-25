@@ -17,6 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createStore } from "./lib/store.js";
 import { parseRss } from "./lib/rss.js";
+import { parseIcs, expandEvents } from "./lib/ics.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -155,6 +156,77 @@ async function fetchHeadlines(topic) {
   return headlines;
 }
 
+// ---- Real integrations (Plan 7): all optional, env-gated, secrets stay
+// server-side. /api/config tells the client which ones are live. ----
+
+// Home Assistant. The proxy below is the security boundary — HA tokens are
+// full-admin, so it is deliberately NOT a generic passthrough: domains,
+// services, entity ids, and extra data are all allowlisted.
+const HA_URL = (process.env.HA_URL || "").replace(/\/+$/, "");
+const HA_TOKEN = process.env.HA_TOKEN || "";
+const HA_ENABLED = Boolean(HA_URL && HA_TOKEN);
+const HA_DOMAINS = ["light", "switch", "fan", "climate"];
+const HA_SERVICES = ["turn_on", "turn_off", "set_temperature"];
+const HA_ENTITY_RE = /^(light|switch|fan|climate)\.[a-z0-9_]+$/;
+
+async function haFetch(pathname, init = {}) {
+  return fetch(HA_URL + pathname, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${HA_TOKEN}`,
+      "Content-Type": "application/json",
+      ...(init.headers || {}),
+    },
+    signal: AbortSignal.timeout(8000),
+  });
+}
+
+// Calendar (read-only ICS feed).
+const ICS_URL = process.env.ICS_URL || "";
+const ICS_CACHE_MS = 15 * 60 * 1000;
+let icsCache = null; // { at, text }
+
+async function fetchCalendar(days) {
+  if (!icsCache || Date.now() - icsCache.at > ICS_CACHE_MS) {
+    const resp = await fetch(ICS_URL, { signal: AbortSignal.timeout(8000) });
+    if (!resp.ok) throw new Error(`Calendar feed returned HTTP ${resp.status}`);
+    icsCache = { at: Date.now(), text: await resp.text() };
+  }
+  const now = Date.now();
+  const { events, unsupported } = expandEvents(
+    parseIcs(icsCache.text),
+    now - 60 * 60 * 1000,
+    now + days * 24 * 60 * 60 * 1000
+  );
+  return {
+    events: events.slice(0, 15).map(e => ({
+      summary: e.summary,
+      start_iso: new Date(e.start).toISOString(),
+      end_iso: new Date(e.end).toISOString(),
+      all_day: e.allDay,
+    })),
+    ...(unsupported ? { note: "some repeating events couldn't be read" } : {}),
+  };
+}
+
+// Internet radio. Names flow to the client via /api/config; stream URLs stay
+// server-side behind a 302 so users can swap streams without touching JS.
+// Defaults are SomaFM's public MP3 streams (listener-supported, direct
+// players historically permitted with attribution — see README).
+const DEFAULT_RADIO_STREAMS = {
+  jazz: "https://ice1.somafm.com/sonicuniverse-128-mp3",
+  chill: "https://ice1.somafm.com/groovesalad-128-mp3",
+  lofi: "https://ice1.somafm.com/fluid-128-mp3",
+};
+let radioStreams = DEFAULT_RADIO_STREAMS;
+if (process.env.RADIO_STREAMS) {
+  try {
+    radioStreams = { ...DEFAULT_RADIO_STREAMS, ...JSON.parse(process.env.RADIO_STREAMS) };
+  } catch {
+    console.warn("  ⚠  RADIO_STREAMS is not valid JSON — using built-in streams.");
+  }
+}
+
 // Shape check for PUT /api/lists bodies: object of listName → string items,
 // with sane caps so a buggy client can't balloon the store.
 function validLists(lists) {
@@ -241,6 +313,99 @@ const requestHandler = async (req, res) => {
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: String(err.message || err) }));
       }
+      return;
+    }
+
+    // Which optional integrations are live (non-secret config only).
+    if (req.method === "GET" && req.url.split("?")[0] === "/api/config") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        homeAssistant: HA_ENABLED,
+        calendar: Boolean(ICS_URL),
+        radio: Object.keys(radioStreams).map(name => ({ name })),
+      }));
+      return;
+    }
+
+    if (req.method === "GET" && req.url.split("?")[0] === "/api/ha/states") {
+      if (!HA_ENABLED) { res.writeHead(404); res.end(); return; }
+      try {
+        const resp = await haFetch("/api/states");
+        if (!resp.ok) throw new Error(`HA returned HTTP ${resp.status}`);
+        const states = await resp.json();
+        const devices = states
+          .filter(s => HA_DOMAINS.includes(String(s.entity_id).split(".")[0]))
+          .map(s => ({
+            entity_id: s.entity_id,
+            name: s.attributes?.friendly_name || s.entity_id,
+            domain: s.entity_id.split(".")[0],
+            state: s.state,
+            ...(typeof s.attributes?.temperature === "number" ? { temp: s.attributes.temperature } : {}),
+          }));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(devices));
+      } catch (err) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: String(err.message || err) }));
+      }
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/api/ha/call") {
+      if (!HA_ENABLED) { res.writeHead(404); res.end(); return; }
+      let call;
+      try { call = JSON.parse(await readBody(req)); } catch { call = null; }
+      const dataOk = call?.data === undefined ||
+        (call?.data && typeof call.data === "object" &&
+         Object.keys(call.data).every(k => k === "temperature") &&
+         (call.data.temperature === undefined || typeof call.data.temperature === "number"));
+      if (
+        !call ||
+        !HA_DOMAINS.includes(call.domain) ||
+        !HA_SERVICES.includes(call.service) ||
+        !HA_ENTITY_RE.test(call.entity_id || "") ||
+        !dataOk
+      ) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Bad service call" }));
+        return;
+      }
+      try {
+        const resp = await haFetch(`/api/services/${call.domain}/${call.service}`, {
+          method: "POST",
+          body: JSON.stringify({ entity_id: call.entity_id, ...(call.data || {}) }),
+        });
+        if (!resp.ok) throw new Error(`HA returned HTTP ${resp.status}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: String(err.message || err) }));
+      }
+      return;
+    }
+
+    if (req.method === "GET" && req.url.split("?")[0] === "/api/calendar") {
+      if (!ICS_URL) { res.writeHead(404); res.end(); return; }
+      const days = Math.min(7, Math.max(1,
+        parseInt(new URL(req.url, "http://x").searchParams.get("days"), 10) || 1));
+      try {
+        const body = await fetchCalendar(days);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(body));
+      } catch (err) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: String(err.message || err) }));
+      }
+      return;
+    }
+
+    if (req.method === "GET" && req.url.startsWith("/api/radio/")) {
+      const name = decodeURIComponent(req.url.slice("/api/radio/".length).split("?")[0]).toLowerCase();
+      const url = radioStreams[name];
+      if (!url) { res.writeHead(404); res.end(); return; }
+      res.writeHead(302, { Location: url });
+      res.end();
       return;
     }
 
