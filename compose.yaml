@@ -1,0 +1,12 @@
+services:
+  nova:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file: .env
+    volumes:
+      - nova-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  nova-data:

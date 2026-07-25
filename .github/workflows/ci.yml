@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        node: [18, 20, 22]
+        os: [ubuntu-latest, windows-latest] # windows matters: dev box is Windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "${{ matrix.node }}"
+      # Zero dependencies → no install step; CI stays under a minute.
+      - name: Syntax gate (files the tests don't import)
+        shell: bash
+        run: |
+          for f in server.js lib/*.js public/app.js public/sw.js public/lib/*.js; do
+            node --check "$f"
+          done
+      - run: npm test

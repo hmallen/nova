@@ -1,0 +1,12 @@
+.git
+.github
+.env
+.env.example
+data/
+plans/
+test/
+.claude/
+certs/
+Dockerfile
+compose.yaml
+*.md

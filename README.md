@@ -167,6 +167,36 @@ the static shell (network-first, so development always serves fresh files
 while the server is up); if it ever gets in your way, unregister it via
 DevTools → Application → Service workers.
 
+## Testing
+
+```bash
+npm test        # node:test — zero dev dependencies, Node 18+
+```
+
+Unit tests cover the extracted server modules (`lib/env.js`, `lib/store.js`,
+`lib/rss.js`, `lib/ics.js`, `lib/prefs.js`) and the shared browser helpers in
+`public/lib/helpers.js`; an HTTP smoke test boots the real server
+(`createNovaServer({ env, dataDir })`) on an ephemeral port with a temp data
+dir and exercises static serving, path-traversal rejection, the lists
+PUT/GET/409 cycle, and the Home Assistant call validation. CI
+(`.github/workflows/ci.yml`) runs the suite on Node 18/20/22 × Ubuntu/Windows.
+
+## Docker
+
+```bash
+docker build -t nova .
+docker run -d -p 3000:3000 --env-file .env -v nova-data:/app/data nova
+# or: docker compose up -d
+```
+
+No install or build stage — the image is copy-and-run. The named volume
+persists `data/state.json` (shared lists) across restarts. If you bind-mount
+a host directory instead of a named volume, make sure it's writable by the
+container's `node` user (uid 1000) — bind mounts don't inherit the image's
+ownership. For HTTPS in Docker, either mount your certs directory and set
+`HTTPS_CERT`/`HTTPS_KEY`, or (recommended) terminate TLS at your reverse
+proxy (Caddy/Traefik) in front of the container.
+
 ## Research notes: OpenAI voice APIs, July 2026
 
 Findings from researching the current generation before building:
