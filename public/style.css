@@ -1,0 +1,225 @@
+/* Nova — Echo-inspired dark UI */
+
+:root {
+  --bg: #0a0e14;
+  --panel: #121826;
+  --panel-2: #1a2233;
+  --text: #e8edf5;
+  --muted: #7c8a9e;
+  --cyan: #00d4ff;
+  --cyan-dim: #0891b2;
+  --amber: #fbbf24;
+  --green: #34d399;
+  --red: #f87171;
+  --ring-size: 180px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: radial-gradient(1200px 600px at 50% -10%, #101a2e 0%, var(--bg) 60%);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  min-height: 100vh;
+}
+
+main {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 28px 20px 60px;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  justify-content: center;
+  margin-bottom: 24px;
+}
+
+h1 {
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  background: linear-gradient(90deg, var(--cyan), #7dd3fc);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.subtitle { color: var(--muted); font-size: 13px; }
+
+h2 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+/* ---- Light ring ---- */
+
+.ring-area {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 30px;
+}
+
+.ring {
+  position: relative;
+  width: var(--ring-size);
+  height: var(--ring-size);
+  border-radius: 50%;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: transform 0.15s ease;
+}
+.ring:active { transform: scale(0.97); }
+
+.ring-glow {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 7px solid var(--cyan-dim);
+  box-shadow: 0 0 24px 2px rgba(0, 212, 255, 0.25), inset 0 0 18px rgba(0, 212, 255, 0.15);
+  transition: border-color 0.3s, box-shadow 0.3s;
+}
+
+.ring-core {
+  position: absolute;
+  inset: 14px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #1c2942, #0b101c 70%);
+}
+
+.mic-icon {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  color: var(--muted);
+  transition: color 0.3s;
+}
+
+/* ring states */
+.ring.idle .ring-glow { border-color: #2a3a52; box-shadow: none; }
+
+.ring.connecting .ring-glow {
+  border-color: var(--amber);
+  animation: spin-pulse 1.2s linear infinite;
+}
+
+.ring.listening .ring-glow {
+  border-color: var(--cyan);
+  box-shadow: 0 0 30px 4px rgba(0, 212, 255, 0.45), inset 0 0 22px rgba(0, 212, 255, 0.25);
+}
+.ring.listening .mic-icon { color: var(--cyan); }
+
+.ring.thinking .ring-glow {
+  border-color: var(--cyan);
+  animation: spin-pulse 0.9s linear infinite;
+}
+
+.ring.speaking .ring-glow {
+  border-color: var(--cyan);
+  animation: breathe var(--breathe-speed, 0.8s) ease-in-out infinite;
+}
+.ring.speaking .mic-icon { color: var(--cyan); }
+
+.ring.muted .ring-glow { border-color: var(--red); }
+.ring.muted .mic-icon { color: var(--red); }
+
+@keyframes breathe {
+  0%, 100% { box-shadow: 0 0 18px 1px rgba(0, 212, 255, 0.3); }
+  50% { box-shadow: 0 0 42px 8px rgba(0, 212, 255, 0.6); }
+}
+
+@keyframes spin-pulse {
+  0% { transform: rotate(0deg); border-top-color: transparent; }
+  100% { transform: rotate(360deg); border-top-color: transparent; }
+}
+
+.status { color: var(--muted); font-size: 15px; min-height: 22px; text-align: center; }
+
+.controls { display: flex; gap: 10px; }
+
+.pill {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid #263349;
+  border-radius: 999px;
+  padding: 7px 16px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.pill:hover { background: #223050; border-color: var(--cyan-dim); }
+.pill.active { border-color: var(--cyan); color: var(--cyan); }
+
+.wake-hint { color: var(--cyan); font-size: 13px; }
+
+/* ---- Cards ---- */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+  margin-bottom: 26px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid #1f2a3d;
+  border-radius: 14px;
+  padding: 16px;
+}
+
+.card ul { list-style: none; }
+.card li { padding: 5px 0; font-size: 14px; display: flex; justify-content: space-between; gap: 8px; }
+
+.timer-time { color: var(--cyan); font-variant-numeric: tabular-nums; font-weight: 600; }
+.timer-done { color: var(--amber); animation: blink 1s step-end infinite; }
+@keyframes blink { 50% { opacity: 0.35; } }
+
+.list-name { color: var(--text); font-weight: 600; font-size: 13px; margin: 8px 0 2px; text-transform: capitalize; }
+.list-items li { color: #c5d0de; padding: 2px 0; }
+.list-items li::before { content: "• "; color: var(--cyan-dim); }
+
+#weatherBody { font-size: 14px; line-height: 1.6; color: #c5d0de; }
+#weatherBody .temp { font-size: 30px; color: var(--text); font-weight: 300; }
+
+/* smart home device chips */
+.devices { display: flex; flex-wrap: wrap; gap: 8px; }
+.device {
+  border: 1px solid #263349;
+  background: var(--panel-2);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  transition: all 0.25s;
+}
+.device .dot { width: 8px; height: 8px; border-radius: 50%; background: #3a4a63; transition: all 0.25s; }
+.device.on { color: var(--text); border-color: rgba(52, 211, 153, 0.5); }
+.device.on .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
+.device .val { color: var(--cyan); }
+
+/* ---- Transcript ---- */
+
+.transcript-area { background: var(--panel); border: 1px solid #1f2a3d; border-radius: 14px; padding: 16px; }
+
+.transcript { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+
+.transcript .hint { color: var(--muted); font-size: 13px; line-height: 1.7; }
+
+.msg { padding: 8px 12px; border-radius: 10px; font-size: 14px; line-height: 1.45; max-width: 85%; }
+.msg.user { background: #1c2e4a; align-self: flex-end; }
+.msg.assistant { background: var(--panel-2); align-self: flex-start; }
+.msg.event { background: none; color: var(--muted); font-size: 12px; align-self: center; padding: 2px; }
+.msg .who { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 2px; }

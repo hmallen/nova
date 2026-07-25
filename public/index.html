@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nova — Voice Assistant</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='40' fill='none' stroke='%2300d4ff' stroke-width='12'/></svg>" />
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Nova</h1>
+      <span class="subtitle">powered by gpt-realtime-2.1</span>
+    </header>
+
+    <!-- Echo-style light ring -->
+    <section class="ring-area">
+      <div id="ring" class="ring idle" title="Click to start or stop Nova">
+        <div class="ring-glow"></div>
+        <div class="ring-core"></div>
+        <svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="9" y="2" width="6" height="12" rx="3"/>
+          <path d="M5 10v1a7 7 0 0 0 14 0v-1"/>
+          <line x1="12" y1="18" x2="12" y2="22"/>
+        </svg>
+      </div>
+      <div id="status" class="status">Tap the ring to wake Nova</div>
+      <div class="controls">
+        <button id="muteBtn" class="pill" hidden>Mute mic</button>
+        <button id="wakeBtn" class="pill">Enable wake word</button>
+      </div>
+      <div id="wakeHint" class="wake-hint" hidden>Say “Nova” to start talking</div>
+    </section>
+
+    <!-- Live cards -->
+    <section class="cards">
+      <div class="card" id="timersCard" hidden>
+        <h2>Timers, Alarms &amp; Reminders</h2>
+        <ul id="timersList"></ul>
+      </div>
+      <div class="card" id="weatherCard" hidden>
+        <h2>Weather</h2>
+        <div id="weatherBody"></div>
+      </div>
+      <div class="card" id="listsCard" hidden>
+        <h2>Lists</h2>
+        <div id="listsBody"></div>
+      </div>
+      <div class="card">
+        <h2>Smart Home</h2>
+        <div id="devicesBody" class="devices"></div>
+      </div>
+    </section>
+
+    <!-- Conversation transcript -->
+    <section class="transcript-area">
+      <h2>Conversation</h2>
+      <div id="transcript" class="transcript">
+        <p class="hint">Try: “What’s the weather in Seattle?” · “Set a pasta timer for 8 minutes” ·
+        “Add milk to my shopping list” · “Turn on the living room light” ·
+        “Play rain sounds” · “Tell me a joke”</p>
+      </div>
+    </section>
+  </main>
+
+  <audio id="assistantAudio" autoplay></audio>
+  <script src="app.js"></script>
+</body>
+</html>
