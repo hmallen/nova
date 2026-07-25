@@ -65,8 +65,13 @@ Browser ──(mic audio via WebRTC)──────────► OpenAI Rea
   `cancel_timer_or_alarm`, `get_weather` (Open-Meteo, no key needed),
   `manage_list`, `control_device` (simulated smart home), `play_ambient_sound`
   (rain / white noise / ocean, synthesized with Web Audio), `stop_ambient_sound`,
-  `set_volume`. Lists, device states, and timers/alarms/reminders persist in
-  `localStorage`.
+  `set_volume`, `manage_preferences`. Device states, preferences, and
+  timers/alarms/reminders persist in `localStorage`.
+- **Lists are shared across devices** — stored server-side in `data/state.json`
+  behind `GET/PUT /api/lists` and polled every 4 s by visible clients, so the
+  item a phone adds shows up on the kitchen tablet within seconds. Edits made
+  while the server is unreachable are kept locally (an "offline" badge shows on
+  the Lists card) and resynced automatically.
 - **Timers, alarms & reminders** ring with a synthesized chime *and* inject a
   conversation item so Nova announces them by voice, like Alexa does —
   reminders as "This is your reminder to …". They survive page refreshes;
@@ -118,6 +123,10 @@ Sources:
 - The wake word runs on-device via the Web Speech API (Chrome/Edge) and only
   *starts* a session; keeping a Realtime session always-on just to detect a
   wake word would stream audio (and billing) continuously.
+- List sync has no auth — anyone on your LAN can read or edit lists (the same
+  trust level as a smart speaker on your network). Timers, alarms, and
+  reminders stay per-device on purpose: a timer set on the kitchen tablet
+  should ring on the kitchen tablet, and cross-device ringing would need push.
 - Preferences (name, home city, units, voice) are a single per-browser profile —
   multiple people sharing one browser share one set of preferences.
 - Realtime audio is billed per audio token; use `REALTIME_MODEL=gpt-realtime-2.1-mini`

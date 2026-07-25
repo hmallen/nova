@@ -10,13 +10,18 @@
 
 import http from "node:http";
 import { readFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createStore } from "./lib/store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
+const DATA_DIR = path.join(__dirname, "data");
 const PORT = Number(process.env.PORT || 3000);
+
+mkdirSync(DATA_DIR, { recursive: true });
+const store = createStore(path.join(DATA_DIR, "state.json"));
 
 // Minimal .env loader so no dotenv dependency is needed.
 const envPath = path.join(__dirname, ".env");
@@ -106,6 +111,20 @@ function sanitizePrefs(raw) {
   return prefs;
 }
 
+// Shape check for PUT /api/lists bodies: object of listName → string items,
+// with sane caps so a buggy client can't balloon the store.
+function validLists(lists) {
+  if (!lists || typeof lists !== "object" || Array.isArray(lists)) return false;
+  const names = Object.keys(lists);
+  if (names.length > 20) return false;
+  for (const name of names) {
+    const items = lists[name];
+    if (!Array.isArray(items) || items.length > 100) return false;
+    if (!items.every(i => typeof i === "string" && i.length <= 200)) return false;
+  }
+  return true;
+}
+
 // Session template. Tool definitions live in the client (public/app.js)
 // alongside their implementations and are attached via session.update once the
 // data channel opens.
@@ -179,6 +198,47 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: String(err.message || err) }));
       }
       return;
+    }
+
+    // Shared lists (Plan 3). No auth: the server is LAN-local and already
+    // gates nothing else — same trust level as an Echo on your network.
+    if (req.url.split("?")[0] === "/api/lists") {
+      if (req.method === "GET") {
+        const since = parseInt(new URL(req.url, "http://x").searchParams.get("since"), 10);
+        const cur = store.get();
+        if (Number.isInteger(since) && since === cur.rev) {
+          res.writeHead(304); res.end(); return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(cur));
+        return;
+      }
+      if (req.method === "PUT") {
+        let body;
+        try { body = JSON.parse(await readBody(req)); } catch { body = null; }
+        if (!body || !Number.isInteger(body.rev) || !validLists(body.lists)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Bad lists payload" }));
+          return;
+        }
+        // Rev check runs inside the serialized update chain so two racing
+        // PUTs can't both commit against the same rev.
+        let conflict = false;
+        const next = await store.update((cur) => {
+          if (body.rev !== cur.rev) { conflict = true; return null; }
+          return body.lists;
+        });
+        if (conflict) {
+          // Stale client: hand back current state so it can re-apply on top.
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(next));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ rev: next.rev }));
+        return;
+      }
+      res.writeHead(405); res.end(); return;
     }
 
     // Static files

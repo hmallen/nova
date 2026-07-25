@@ -41,7 +41,9 @@ const state = {
   timers: [],    // {id, kind:"timer",    label, endsAt, done}
   alarms: [],    // {id, kind:"alarm",    label, time:"HH:MM", days:[0..6]|null, done, lastFiredOn:"YYYY-MM-DD"|null}
   reminders: [], // {id, kind:"reminder", text, at:epochMs, done, missed}
-  lists: JSON.parse(localStorage.getItem("nova.lists") || '{"shopping":[],"to-do":[]}'),
+  lists: {},         // synced with the server (Plan 3); localStorage is only a crash backup
+  listsRev: 0,
+  listsOffline: false,
   devices: JSON.parse(localStorage.getItem("nova.devices") || "null") || {
     "living room light": { on: false },
     "bedroom light": { on: false },
@@ -409,32 +411,13 @@ const toolHandlers = {
 
   async manage_list({ action, list = "shopping", item }) {
     const key = list.toLowerCase().replace(/\s+list$/, "").trim() || "shopping";
-    state.lists[key] = state.lists[key] || [];
-    const items = state.lists[key];
-    let result;
-    switch (action) {
-      case "add":
-        if (!item) return { error: "No item given." };
-        items.push(item);
-        result = { ok: true, list: key, added: item, count: items.length };
-        break;
-      case "remove": {
-        const idx = items.findIndex(i => i.toLowerCase().includes((item || "").toLowerCase()));
-        if (idx === -1) return { error: `"${item}" is not on the ${key} list.` };
-        const [removed] = items.splice(idx, 1);
-        result = { ok: true, list: key, removed, count: items.length };
-        break;
-      }
-      case "clear":
-        state.lists[key] = [];
-        result = { ok: true, list: key, cleared: true };
-        break;
-      case "read":
-      default:
-        result = { list: key, items: [...items] };
-    }
-    localStorage.setItem("nova.lists", JSON.stringify(state.lists));
+    // Optimistic local mutation — the voice flow must not wait on disk.
+    const result = applyListAction(action, key, item);
     renderLists();
+    if (!result.error && action !== "read") {
+      const sync = await pushLists({ action, key, item });
+      if (sync.warning) result.warning = sync.warning;
+    }
     return result;
   },
 
@@ -522,6 +505,135 @@ const toolHandlers = {
     return { ok: true, volume: state.volume };
   },
 };
+
+// =====================================================================
+// Shared lists: server sync (Plan 3)
+// =====================================================================
+
+// Mutates state.lists and returns the speakable tool result. Kept separate
+// from the tool handler so a 409 retry can re-apply the same single action
+// on top of fresh server state (re-applying an add is always safe;
+// remove/clear are idempotent).
+function applyListAction(action, key, item) {
+  state.lists[key] = state.lists[key] || [];
+  const items = state.lists[key];
+  switch (action) {
+    case "add":
+      if (!item) return { error: "No item given." };
+      items.push(item);
+      return { ok: true, list: key, added: item, count: items.length };
+    case "remove": {
+      const idx = items.findIndex(i => i.toLowerCase().includes((item || "").toLowerCase()));
+      if (idx === -1) return { error: `"${item}" is not on the ${key} list.` };
+      const [removed] = items.splice(idx, 1);
+      return { ok: true, list: key, removed, count: items.length };
+    }
+    case "clear":
+      state.lists[key] = [];
+      return { ok: true, list: key, cleared: true };
+    case "read":
+    default:
+      return { list: key, items: [...items] };
+  }
+}
+
+function setListsOffline(offline) {
+  state.listsOffline = offline;
+  const badge = document.getElementById("listsOfflineBadge");
+  if (badge) badge.hidden = !offline;
+}
+
+// PUT local lists to the server. On 409, adopt server state, re-apply the
+// user's single action, and retry once.
+async function pushLists(retryAction = null, retried = false) {
+  try {
+    const resp = await fetch("/api/lists", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rev: state.listsRev, lists: state.lists }),
+    });
+    if (resp.status === 409) {
+      const cur = await resp.json();
+      state.lists = cur.lists;
+      state.listsRev = cur.rev;
+      if (retryAction && !retried) {
+        applyListAction(retryAction.action, retryAction.key, retryAction.item);
+        renderLists();
+        return pushLists(retryAction, true);
+      }
+      renderLists();
+      return { warning: "saved locally, sync conflict" };
+    }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    state.listsRev = (await resp.json()).rev;
+    setListsOffline(false);
+    return {};
+  } catch {
+    // Voice flow shouldn't fail because the Wi-Fi blipped: keep local state,
+    // mirror to localStorage as a crash backup, resync on the next good poll.
+    localStorage.setItem("nova.lists", JSON.stringify(state.lists));
+    setListsOffline(true);
+    return {};
+  }
+}
+
+async function initLists() {
+  let local = null;
+  try { local = JSON.parse(localStorage.getItem("nova.lists") || "null"); } catch {}
+  try {
+    const resp = await fetch("/api/lists");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const cur = await resp.json();
+    state.lists = cur.lists;
+    state.listsRev = cur.rev;
+    const serverEmpty = !Object.values(cur.lists).some(items => items.length);
+    const localHasItems = local && Object.values(local).some(items => items?.length);
+    if (serverEmpty && localHasItems) {
+      state.lists = local; // one-time migration of pre-sync localStorage lists
+      await pushLists();
+      if (!state.listsOffline) localStorage.removeItem("nova.lists");
+    }
+  } catch {
+    if (local) state.lists = local; // server unreachable: work offline
+    setListsOffline(true);
+  }
+  renderLists();
+}
+
+// Poll for changes made by other devices — only while someone is looking.
+let listsPollInFlight = false;
+async function pollLists() {
+  if (document.visibilityState !== "visible" || listsPollInFlight) return;
+  listsPollInFlight = true;
+  try {
+    const resp = await fetch(`/api/lists?since=${state.listsRev}`);
+    if (resp.status === 304) {
+      // In sync; if we have offline edits, this is the moment to resync them.
+      if (state.listsOffline) await pushLists();
+    } else if (resp.ok) {
+      const cur = await resp.json();
+      if (state.listsOffline) {
+        // Offline edits win the resync: adopt the server rev, keep local
+        // items, push. (True conflicts here are rare enough not to merge.)
+        state.listsRev = cur.rev;
+        await pushLists();
+      } else {
+        state.lists = cur.lists;
+        state.listsRev = cur.rev;
+        setListsOffline(false);
+        renderLists();
+      }
+    }
+  } catch {
+    setListsOffline(true);
+  } finally {
+    listsPollInFlight = false;
+  }
+}
+setInterval(pollLists, 4000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") pollLists();
+});
 
 // =====================================================================
 // Realtime session (WebRTC)
@@ -1146,5 +1258,5 @@ function describeWeatherCode(code) {
 // Initial paint
 loadSchedules();
 renderDevices();
-renderLists();
+initLists(); // async: adopts server lists (or offline fallback) and renders
 renderTimers();
