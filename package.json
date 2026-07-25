@@ -1,0 +1,13 @@
+{
+  "name": "nova-voice-assistant",
+  "version": "1.0.0",
+  "description": "Alexa-style voice assistant built on the OpenAI Realtime API (gpt-realtime-2.1, WebRTC)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
