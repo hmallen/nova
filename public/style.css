@@ -232,3 +232,20 @@ h2 {
 .msg.assistant { background: var(--panel-2); align-self: flex-start; }
 .msg.event { background: none; color: var(--muted); font-size: 12px; align-self: center; padding: 2px; }
 .msg .who { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 2px; }
+
+/* ---- Text input (accessibility / quiet-hours / debugging path) ---- */
+
+.text-form { display: flex; gap: 8px; margin-top: 12px; }
+.text-form input {
+  flex: 1;
+  background: var(--panel-2);
+  border: 1px solid #263349;
+  border-radius: 999px;
+  padding: 8px 14px;
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.text-form input:focus { border-color: var(--cyan-dim); }
+.text-form input::placeholder { color: var(--muted); }

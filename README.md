@@ -44,6 +44,11 @@ Optionally click **Enable wake word** to say "Nova" hands-free to start a
 session (uses the browser's on-device speech recognition purely as a trigger;
 everything after the wake word is OpenAI).
 
+You can also **type to Nova** — the box under the transcript sends text into
+the same session (replies still come back as speech + transcript, and typing
+while Nova is talking interrupts her, like speaking would). Submitting while
+idle starts a session and answers your question in place of the greeting.
+
 ## Architecture
 
 ```
@@ -114,9 +119,11 @@ Findings from researching the current generation before building:
 - **Tools in realtime sessions** work like Chat Completions function calling:
   define tools in the session, receive `response.function_call_arguments.done`,
   reply with a `function_call_output` conversation item plus `response.create`.
-- **No session resume exists** — if the connection drops the session is gone,
-  so the client detects `connectionstatechange` failures and returns to idle
-  for a clean reconnect.
+- **No session resume exists** — if the connection drops the session is gone.
+  The client auto-reconnects (two attempts with backoff, skipped for
+  intentional stops and hidden tabs) by starting a *new* session; Nova says
+  "Sorry, I lost you for a second" instead of re-greeting, but conversation
+  history does not survive a reconnect.
 
 Sources:
 - [Realtime guide](https://developers.openai.com/api/docs/guides/realtime) ·

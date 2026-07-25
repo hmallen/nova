@@ -28,6 +28,15 @@ let micMuted = false;
 let connected = false;
 let assistantSpeaking = false;
 
+// Auto-reconnect (Plan 5). Realtime has no session resume, so "reconnect"
+// means a brand-new session started automatically; conversation history is
+// gone, and Nova just acknowledges the blip.
+let reconnectAttempts = 0;
+let userStopped = false;      // set only by intentional stops — never auto-reconnect those
+let wasReconnect = false;     // the next startSession() is an automatic retry
+let reconnectTimer = null;
+let pendingTypedMessage = null; // typed while disconnected → sent once the channel opens
+
 // ---------- Assistant state (the "skills") ----------
 const DEFAULT_PREFS = {
   name: null,          // "Sam"
@@ -823,24 +832,47 @@ document.addEventListener("visibilitychange", () => {
 // Realtime session (WebRTC)
 // =====================================================================
 
+// User-initiated session start (ring click, wake word, typed message):
+// clears the intentional-stop flag and the reconnect budget.
+function userStartSession() {
+  userStopped = false;
+  reconnectAttempts = 0;
+  wasReconnect = false;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  startSession();
+}
+
+// Mint an ephemeral token, retrying once after 1 s so a server that is
+// briefly restarting doesn't fail the whole session start.
+async function fetchSessionToken() {
+  const attempt = () => fetch("/api/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      prefs: {
+        name: state.prefs.name,
+        homeLabel: state.prefs.homeLabel,
+        units: state.prefs.units,
+        voice: state.prefs.voice,
+      },
+    }),
+  });
+  let resp = null;
+  try { resp = await attempt(); } catch {}
+  if (!resp || resp.status >= 500) {
+    await new Promise(r => setTimeout(r, 1000));
+    resp = await attempt();
+  }
+  return resp;
+}
+
 async function startSession() {
-  setRingState("connecting", "Connecting…");
+  setRingState("connecting", wasReconnect ? "Reconnecting…" : "Connecting…");
   try {
     // 1. Ephemeral client secret from our server (real API key never reaches
     //    the browser). Saved prefs ride along so the server can splice an
     //    "About this user" block into the instructions and pick the voice.
-    const tokenResp = await fetch("/api/session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        prefs: {
-          name: state.prefs.name,
-          homeLabel: state.prefs.homeLabel,
-          units: state.prefs.units,
-          voice: state.prefs.voice,
-        },
-      }),
-    });
+    const tokenResp = await fetchSessionToken();
     const tokenBody = await tokenResp.json();
     if (!tokenResp.ok) throw new Error(tokenBody.error || "Could not create session");
     const EPHEMERAL_KEY = tokenBody.value;
@@ -858,9 +890,20 @@ async function startSession() {
     dc.addEventListener("open", onDataChannelOpen);
     dc.addEventListener("message", (e) => handleServerEvent(JSON.parse(e.data)));
 
+    const thisPc = pc;
     pc.onconnectionstatechange = () => {
-      if (["failed", "disconnected", "closed"].includes(pc.connectionState) && connected) {
-        stopSession("Connection lost — tap the ring to reconnect");
+      if (pc !== thisPc || !connected || userStopped) return;
+      const st = thisPc.connectionState;
+      if (st === "disconnected") {
+        // "disconnected" can self-heal in WebRTC — give it 3 s before acting.
+        setTimeout(() => {
+          if (pc === thisPc && connected && !userStopped &&
+              thisPc.connectionState === "disconnected") {
+            handleConnectionLoss();
+          }
+        }, 3000);
+      } else if (st === "failed" || st === "closed") {
+        handleConnectionLoss();
       }
     };
 
@@ -884,6 +927,13 @@ async function startSession() {
     stopWakeListening(); // wake word not needed while session is live
   } catch (err) {
     console.error(err);
+    teardown();
+    // A failed reconnect attempt (expired token, SDP failure, server still
+    // down) counts against the same budget and retries the same way.
+    if (wasReconnect && !userStopped && reconnectAttempts < 2) {
+      scheduleReconnect();
+      return;
+    }
     const msg = /permission|notallowed/i.test(err.name + err.message)
       ? "Microphone blocked — allow mic access and tap the ring again"
       : `Error: ${err.message}`;
@@ -891,7 +941,43 @@ async function startSession() {
   }
 }
 
+function handleConnectionLoss() {
+  teardown();
+  scheduleReconnect();
+}
+
+function scheduleReconnect() {
+  if (reconnectAttempts >= 2) {
+    stopSession("Connection lost — tap the ring to reconnect");
+    return;
+  }
+  const delay = 1000 * 2 ** reconnectAttempts;
+  reconnectAttempts++;
+  setRingState("connecting", "Reconnecting…");
+  const fire = () => {
+    reconnectTimer = null;
+    if (connected || userStopped) return;
+    if (document.visibilityState === "hidden") {
+      // Don't burn tokens on a session in a tab nobody's looking at —
+      // defer the attempt until the tab is visible again.
+      const onVisible = () => {
+        if (document.visibilityState !== "visible") return;
+        document.removeEventListener("visibilitychange", onVisible);
+        if (!connected && !userStopped) { wasReconnect = true; startSession(); }
+      };
+      document.addEventListener("visibilitychange", onVisible);
+      return;
+    }
+    wasReconnect = true;
+    startSession();
+  };
+  reconnectTimer = setTimeout(fire, delay);
+}
+
 function onDataChannelOpen() {
+  // Reset the reconnect budget only now — resetting in startSession's happy
+  // path would let a mint-token failure loop spin forever.
+  reconnectAttempts = 0;
   setRingState("listening", "Listening — just talk");
   // Register tools + tuned audio settings now that the channel is live.
   sendEvent({
@@ -928,21 +1014,69 @@ function onDataChannelOpen() {
     for (const r of missed) r.done = true; // stays rendered as "missed", but only announced once
     saveSchedules();
   }
-  // Have Nova greet the user, Alexa-style.
-  sendEvent({
-    type: "response.create",
-    response: {
-      instructions: "Greet the user in one short sentence as Nova and invite them to ask for something.",
-    },
-  });
+  const typed = pendingTypedMessage;
+  pendingTypedMessage = null;
+  const reconnected = wasReconnect;
+  wasReconnect = false;
+  if (typed) {
+    // The user asked a question by keyboard; answering it IS the greeting.
+    sendTypedMessage(typed);
+  } else if (reconnected) {
+    sendEvent({
+      type: "response.create",
+      response: { instructions: "Say only: 'Sorry, I lost you for a second.'" },
+    });
+  } else {
+    // Have Nova greet the user, Alexa-style.
+    sendEvent({
+      type: "response.create",
+      response: {
+        instructions: "Greet the user in one short sentence as Nova and invite them to ask for something.",
+      },
+    });
+  }
 }
 
 function sendEvent(evt) {
   if (dc && dc.readyState === "open") dc.send(JSON.stringify(evt));
 }
 
-function stopSession(message = "Tap the ring to wake Nova") {
+// ---------- Text input (Plan 5) ----------
+// Typed messages ride the same data channel and get speech + transcript back,
+// so tools work identically to a spoken turn.
+const textForm = document.getElementById("textForm");
+const textInput = document.getElementById("textInput");
+
+function sendTypedMessage(text) {
+  if (assistantSpeaking) sendEvent({ type: "response.cancel" }); // typed barge-in
+  addMessage("user", text);
+  sendEvent({
+    type: "conversation.item.create",
+    item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
+  });
+  sendEvent({ type: "response.create" });
+}
+
+textForm.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = textInput.value.trim();
+  if (!text) return;
+  textInput.value = "";
+  if (connected && dc?.readyState === "open") {
+    sendTypedMessage(text);
+  } else {
+    // No live session: the box doubles as a mouse-free way to wake Nova.
+    // Last-write-wins while connecting is fine — it's one input box.
+    pendingTypedMessage = text;
+    if (!pc) userStartSession();
+  }
+});
+
+// Release the session's resources without touching the idle UI or wake word
+// — reused by the reconnect path, which immediately starts a new session.
+function teardown() {
   connected = false;
+  assistantSpeaking = false;
   try { dc?.close(); } catch {}
   try { pc?.close(); } catch {}
   micStream?.getTracks().forEach(t => t.stop());
@@ -950,6 +1084,10 @@ function stopSession(message = "Tap the ring to wake Nova") {
   micMuted = false;
   muteBtn.hidden = true;
   muteBtn.textContent = "Mute mic";
+}
+
+function stopSession(message = "Tap the ring to wake Nova") {
+  teardown();
   setRingState("idle", message);
   if (wakeEnabled) startWakeListening();
 }
@@ -1252,7 +1390,7 @@ function startWakeListening() {
       const text = e.results[i][0].transcript.toLowerCase();
       if (/\bnova\b|\bnoah\b/.test(text)) {
         stopWakeListening();
-        startSession();
+        userStartSession();
         return;
       }
     }
@@ -1290,8 +1428,14 @@ wakeBtn.addEventListener("click", () => {
 
 ring.addEventListener("click", () => {
   ctx(); // unlock audio on user gesture
-  if (connected) stopSession();
-  else startSession();
+  if (connected || reconnectTimer) {
+    // Intentional stop (also cancels a pending auto-reconnect).
+    userStopped = true;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    stopSession();
+  } else {
+    userStartSession();
+  }
 });
 
 muteBtn.addEventListener("click", () => {
