@@ -1427,6 +1427,10 @@ wakeBtn.addEventListener("click", () => {
 // =====================================================================
 
 ring.addEventListener("click", () => {
+  if (insecureContext) {
+    setRingState("idle", "Needs HTTPS for the microphone — see README");
+    return;
+  }
   ctx(); // unlock audio on user gesture
   if (connected || reconnectTimer) {
     // Intentional stop (also cancels a pending auto-reconnect).
@@ -1583,8 +1587,22 @@ function describeWeatherCode(code) {
   return map[code] || "Unknown conditions";
 }
 
+// =====================================================================
+// PWA (Plan 6)
+// =====================================================================
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js");
+
+// Mic (and wake word) need a secure context. A tablet on http://<lan-ip>
+// would otherwise hit a misleading "microphone blocked" error — say the
+// real reason and disable the ring instead.
+const insecureContext = !window.isSecureContext;
+
 // Initial paint
 loadSchedules();
 renderDevices();
 initLists(); // async: adopts server lists (or offline fallback) and renders
 renderTimers();
+if (insecureContext) {
+  setRingState("idle", "Needs HTTPS for the microphone — see README");
+}

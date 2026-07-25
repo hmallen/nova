@@ -94,6 +94,37 @@ Browser ──(mic audio via WebRTC)──────────► OpenAI Rea
   reminders that come due while the page is closed show as "missed" and are
   announced once at the start of the next session.
 
+## Use it on a tablet or phone
+
+Nova is a PWA: it installs to a home screen and launches full-screen like a
+real assistant appliance. The one real blocker for a second device is that
+**microphone access requires HTTPS** (only `localhost` is exempt), so:
+
+1. Install [mkcert](https://github.com/FiloSottile/mkcert) on the machine
+   running the server, then:
+
+   ```bash
+   mkcert -install
+   mkdir certs
+   cd certs && mkcert <your-lan-ip> localhost
+   ```
+
+2. Point `.env` at the two generated files (`HTTPS_CERT=./certs/<...>.pem`,
+   `HTTPS_KEY=./certs/<...>-key.pem`) and restart — the server now prints its
+   LAN `https://` URLs at boot.
+3. Install the mkcert root CA on the tablet/phone (mkcert's documented mobile
+   flow: `mkcert -CAROOT`, copy `rootCA.pem` over, trust it in settings).
+   A plain self-signed cert without a trusted CA fails silently for service
+   workers — don't bother.
+4. Open `https://<lan-ip>:3000` on the device, allow the mic, and use
+   **Add to Home Screen** for the full-screen app.
+
+Loading over plain `http://` from a second device shows "Needs HTTPS for the
+microphone" instead of a dead mic prompt. The service worker only pre-caches
+the static shell (network-first, so development always serves fresh files
+while the server is up); if it ever gets in your way, unregister it via
+DevTools → Application → Service workers.
+
 ## Research notes: OpenAI voice APIs, July 2026
 
 Findings from researching the current generation before building:

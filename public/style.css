@@ -27,6 +27,8 @@ main {
   max-width: 860px;
   margin: 0 auto;
   padding: 28px 20px 60px;
+  /* Keep the text input clear of home-screen bars/notches in standalone mode */
+  padding-bottom: calc(60px + env(safe-area-inset-bottom));
 }
 
 header {
@@ -77,6 +79,7 @@ h2 {
   display: grid;
   place-items: center;
   transition: transform 0.15s ease;
+  touch-action: manipulation; /* no 300ms tap delay / double-tap zoom on the primary control */
 }
 .ring:active { transform: scale(0.97); }
 
@@ -147,6 +150,7 @@ h2 {
 .controls { display: flex; gap: 10px; }
 
 .pill {
+  touch-action: manipulation;
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid #263349;
@@ -249,3 +253,11 @@ h2 {
 }
 .text-form input:focus { border-color: var(--cyan-dim); }
 .text-form input::placeholder { color: var(--muted); }
+
+/* ---- Small screens (phone / installed PWA) ---- */
+
+@media (max-width: 480px) {
+  :root { --ring-size: 150px; }
+  main { padding-top: 16px; }
+  .transcript { max-height: 240px; }
+}

@@ -9,6 +9,8 @@
 // Zero npm dependencies — Node 18+ only.
 
 import http from "node:http";
+import https from "node:https";
+import os from "node:os";
 import { readFile } from "node:fs/promises";
 import { existsSync, readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
@@ -218,7 +220,7 @@ const MIME = {
   ".json": "application/json",
 };
 
-const server = http.createServer(async (req, res) => {
+const requestHandler = async (req, res) => {
   try {
     if (req.method === "POST" && req.url === "/api/session") {
       if (!OPENAI_API_KEY) {
@@ -313,11 +315,33 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     res.writeHead(500); res.end("Server error");
   }
-});
+};
+
+// HTTPS is optional but required for any second device on the LAN: mic access
+// (and the wake word) needs a secure context, and only localhost gets one
+// over plain HTTP. See README "Use it on a tablet or phone" (mkcert setup).
+const HTTPS_CERT = process.env.HTTPS_CERT;
+const HTTPS_KEY = process.env.HTTPS_KEY;
+const useHttps = Boolean(HTTPS_CERT && HTTPS_KEY);
+const server = useHttps
+  ? https.createServer({
+      cert: readFileSync(path.resolve(__dirname, HTTPS_CERT)),
+      key: readFileSync(path.resolve(__dirname, HTTPS_KEY)),
+    }, requestHandler)
+  : http.createServer(requestHandler);
 
 server.listen(PORT, () => {
+  const proto = useHttps ? "https" : "http";
   console.log(`\n  Nova voice assistant`);
-  console.log(`  → http://localhost:${PORT}`);
+  console.log(`  → ${proto}://localhost:${PORT}`);
+  if (useHttps) {
+    // Show LAN addresses so the user knows what to type on the tablet.
+    for (const addrs of Object.values(os.networkInterfaces())) {
+      for (const a of addrs || []) {
+        if (a.family === "IPv4" && !a.internal) console.log(`  → ${proto}://${a.address}:${PORT}  (LAN)`);
+      }
+    }
+  }
   console.log(`  model: ${REALTIME_MODEL}, voice: ${VOICE}`);
   if (!OPENAI_API_KEY) {
     console.warn(`\n  ⚠  OPENAI_API_KEY not set — copy .env.example to .env and add your key.\n`);
