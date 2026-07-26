@@ -135,6 +135,13 @@ h2 {
 .ring.muted .ring-glow { border-color: var(--red); }
 .ring.muted .mic-icon { color: var(--red); }
 
+/* Text mode: connected and ready, but the mic was never opened. A steady dim
+   glow with the mic icon left grey, so "not listening" reads at a glance. */
+.ring.texting .ring-glow {
+  border-color: #3d5a7a;
+  box-shadow: 0 0 16px 1px rgba(0, 212, 255, 0.14);
+}
+
 @keyframes breathe {
   0%, 100% { box-shadow: 0 0 18px 1px rgba(0, 212, 255, 0.3); }
   50% { box-shadow: 0 0 42px 8px rgba(0, 212, 255, 0.6); }
