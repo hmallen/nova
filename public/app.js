@@ -3,6 +3,7 @@
  * Flow (2026 best practice):
  *   1. POST /api/session → server mints an ephemeral client secret ("ek_...")
  *   2. Browser opens an RTCPeerConnection: mic track up, assistant audio down
+ *      (or, in text mode, no mic at all — see sessionMode)
  *   3. SDP offer is POSTed to https://api.openai.com/v1/realtime/calls
  *   4. JSON events flow over the "oai-events" data channel
  *   5. Tools are registered via session.update; function calls are executed
@@ -27,6 +28,15 @@ let micStream = null;
 let micMuted = false;
 let connected = false;
 let assistantSpeaking = false;
+
+// How the current session talks. "voice" is the ring: mic up, spoken replies.
+// "text" is the type-to-Nova box: the mic is never opened and replies come
+// back written. Only an explicit user action picks a mode — typing must never
+// switch the microphone on by itself.
+let sessionMode = "voice";
+// Modality of the response currently in flight, so a tool-call follow-up
+// answers in the same form as the turn that triggered it.
+let lastTurnTextOnly = false;
 
 // Auto-reconnect (Plan 5). Realtime has no session resume, so "reconnect"
 // means a brand-new session started automatically; conversation history is
@@ -970,8 +980,10 @@ document.addEventListener("visibilitychange", () => {
 // =====================================================================
 
 // User-initiated session start (ring click, wake word, typed message):
-// clears the intentional-stop flag and the reconnect budget.
-function userStartSession() {
+// clears the intentional-stop flag and the reconnect budget. The mode sticks
+// for the session, including across auto-reconnects.
+function userStartSession(mode = "voice") {
+  sessionMode = mode;
   userStopped = false;
   reconnectAttempts = 0;
   wasReconnect = false;
@@ -1014,13 +1026,20 @@ async function startSession() {
     if (!tokenResp.ok) throw new Error(tokenBody.error || "Could not create session");
     const EPHEMERAL_KEY = tokenBody.value;
 
-    // 2. Peer connection: mic up, assistant audio down
+    // 2. Peer connection: mic up, assistant audio down. A text session skips
+    //    getUserMedia entirely — no permission prompt, no recording indicator
+    //    — and offers a recvonly audio line so the SDP still carries the audio
+    //    m-line the Realtime API expects.
     pc = new RTCPeerConnection();
     pc.ontrack = (e) => { assistantAudio.srcObject = e.streams[0]; };
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
-    pc.addTrack(micStream.getTracks()[0], micStream);
+    if (sessionMode === "text") {
+      pc.addTransceiver("audio", { direction: "recvonly" });
+    } else {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      pc.addTrack(micStream.getTracks()[0], micStream);
+    }
 
     // 3. Data channel for JSON events
     dc = pc.createDataChannel("oai-events");
@@ -1060,7 +1079,7 @@ async function startSession() {
 
     connected = true;
     assistantAudio.volume = state.volume / 10;
-    muteBtn.hidden = false;
+    muteBtn.hidden = sessionMode !== "voice"; // nothing to mute without a mic
     stopWakeListening(); // wake word not needed while session is live
   } catch (err) {
     console.error(err);
@@ -1115,7 +1134,7 @@ async function onDataChannelOpen() {
   // Reset the reconnect budget only now — resetting in startSession's happy
   // path would let a mint-token failure loop spin forever.
   reconnectAttempts = 0;
-  setRingState("listening", "Listening — just talk");
+  setReadyState();
   await configReady; // tool list depends on which integrations are live
   // Register tools + tuned audio settings now that the channel is live.
   sendEvent({
@@ -1124,14 +1143,23 @@ async function onDataChannelOpen() {
       type: "realtime",
       tools: buildTools(),
       tool_choice: "auto",
-      audio: {
-        input: {
-          transcription: { model: "gpt-realtime-whisper" },
-          // Semantic VAD: end-of-turn detection based on what is said, not
-          // just silence — the current best practice for assistant UX.
-          turn_detection: { type: "semantic_vad" },
-        },
-      },
+      // A text session has no mic feeding it, so there is no turn to detect
+      // and nothing to transcribe — and every reply is written, not spoken.
+      ...(sessionMode === "text"
+        ? {
+            output_modalities: ["text"],
+            audio: { input: { turn_detection: null } },
+          }
+        : {
+            audio: {
+              input: {
+                transcription: { model: "gpt-realtime-whisper" },
+                // Semantic VAD: end-of-turn detection based on what is said,
+                // not just silence — best practice for assistant UX.
+                turn_detection: { type: "semantic_vad" },
+              },
+            },
+          }),
     },
   });
   // Reminders that came due while the page was closed: announce once.
@@ -1160,17 +1188,11 @@ async function onDataChannelOpen() {
     // The user asked a question by keyboard; answering it IS the greeting.
     sendTypedMessage(typed);
   } else if (reconnected) {
-    sendEvent({
-      type: "response.create",
-      response: { instructions: "Say only: 'Sorry, I lost you for a second.'" },
-    });
+    createResponse({ instructions: "Say only: 'Sorry, I lost you for a second.'" });
   } else {
     // Have Nova greet the user, Alexa-style.
-    sendEvent({
-      type: "response.create",
-      response: {
-        instructions: "Greet the user in one short sentence as Nova and invite them to ask for something.",
-      },
+    createResponse({
+      instructions: "Greet the user in one short sentence as Nova and invite them to ask for something.",
     });
   }
 }
@@ -1180,10 +1202,23 @@ function sendEvent(evt) {
 }
 
 // ---------- Text input (Plan 5) ----------
-// Typed messages ride the same data channel and get speech + transcript back,
-// so tools work identically to a spoken turn.
+// Typed messages ride the same data channel as spoken ones — same tools, same
+// conversation — but they answer in kind: type a question, read the answer.
 const textForm = document.getElementById("textForm");
 const textInput = document.getElementById("textInput");
+
+// Every response.create funnels through here so reply modality is decided in
+// one place. Text sessions and typed turns come back written; spoken turns
+// come back as speech + transcript.
+function createResponse({ textOnly = sessionMode === "text", instructions } = {}) {
+  lastTurnTextOnly = textOnly;
+  const response = {};
+  if (textOnly) response.output_modalities = ["text"];
+  if (instructions) response.instructions = instructions;
+  sendEvent(Object.keys(response).length
+    ? { type: "response.create", response }
+    : { type: "response.create" });
+}
 
 function sendTypedMessage(text) {
   if (assistantSpeaking) sendEvent({ type: "response.cancel" }); // typed barge-in
@@ -1192,7 +1227,10 @@ function sendTypedMessage(text) {
     type: "conversation.item.create",
     item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
   });
-  sendEvent({ type: "response.create" });
+  // Typed in, typed out — a keyboard question gets a written answer even in
+  // the middle of a spoken session, where Nova would otherwise talk over you.
+  createResponse({ textOnly: true });
+  setRingState("thinking", "Thinking…");
 }
 
 textForm.addEventListener("submit", (e) => {
@@ -1203,10 +1241,11 @@ textForm.addEventListener("submit", (e) => {
   if (connected && dc?.readyState === "open") {
     sendTypedMessage(text);
   } else {
-    // No live session: the box doubles as a mouse-free way to wake Nova.
+    // No live session: the box wakes Nova in text mode. Typing must never open
+    // the microphone — the ring is the only control that does that.
     // Last-write-wins while connecting is fine — it's one input box.
     pendingTypedMessage = text;
-    if (!pc) userStartSession();
+    if (!pc) userStartSession("text");
   }
 });
 
@@ -1252,12 +1291,20 @@ function handleServerEvent(evt) {
 
     // Assistant speech transcript, streamed
     case "response.output_audio_transcript.delta":
-      if (!currentAssistantMsg) currentAssistantMsg = addMessage("assistant", "");
-      currentAssistantMsg.textContent += evt.delta;
-      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+      appendAssistantDelta(evt.delta);
       break;
 
     case "response.output_audio_transcript.done":
+      currentAssistantMsg = null;
+      break;
+
+    // Written reply, streamed — text sessions and typed turns take this path
+    // instead of the transcript one, since nothing is spoken.
+    case "response.output_text.delta":
+      appendAssistantDelta(evt.delta);
+      break;
+
+    case "response.output_text.done":
       currentAssistantMsg = null;
       break;
 
@@ -1271,7 +1318,7 @@ function handleServerEvent(evt) {
     case "output_audio_buffer.cleared":
       assistantSpeaking = false;
       applyDucking();
-      if (connected) setRingState("listening", "Listening — just talk");
+      if (connected) setReadyState();
       break;
 
     case "response.function_call_arguments.done":
@@ -1279,7 +1326,8 @@ function handleServerEvent(evt) {
       break;
 
     case "response.done":
-      if (!assistantSpeaking && connected) setRingState("listening", "Listening — just talk");
+      currentAssistantMsg = null;
+      if (!assistantSpeaking && connected) setReadyState();
       break;
 
     case "error":
@@ -1304,7 +1352,9 @@ async function runTool(name, callId, argsJson) {
     type: "conversation.item.create",
     item: { type: "function_call_output", call_id: callId, output: JSON.stringify(output) },
   });
-  sendEvent({ type: "response.create" });
+  // Answer in the same form as the turn that called the tool, so a typed
+  // question doesn't get its answer read aloud just because a tool ran.
+  createResponse({ textOnly: lastTurnTextOnly });
 }
 
 function summarizeArgs(args) {
@@ -1373,7 +1423,7 @@ function onTimerFired(t) {
         content: [{ type: "input_text", text }],
       },
     });
-    sendEvent({ type: "response.create" });
+    createResponse();
   }
   // Auto-clear finished entries after a while — recurring alarms and snoozed
   // reminders (done flipped back to false) stay.
@@ -1559,7 +1609,7 @@ radioAudio.addEventListener("error", () => {
         }],
       },
     });
-    sendEvent({ type: "response.create" });
+    createResponse();
   }
 });
 
@@ -1582,7 +1632,7 @@ function startWakeListening() {
       const text = e.results[i][0].transcript.toLowerCase();
       if (/\bnova\b|\bnoah\b/.test(text)) {
         stopWakeListening();
-        userStartSession();
+        userStartSession("voice");
         return;
       }
     }
@@ -1620,17 +1670,26 @@ wakeBtn.addEventListener("click", () => {
 
 ring.addEventListener("click", () => {
   if (insecureContext) {
-    setRingState("idle", "Needs HTTPS for the microphone — see README");
+    setRingState(connected ? "texting" : "idle", "Needs HTTPS for the microphone — see README");
     return;
   }
   ctx(); // unlock audio on user gesture
+  if (connected && sessionMode === "text") {
+    // The ring is the microphone, so from a text session it opens voice rather
+    // than hanging up. Realtime has no session resume, so this is a fresh
+    // session — the on-screen transcript stays, the model's memory of it
+    // doesn't, same as an auto-reconnect.
+    teardown();
+    userStartSession("voice");
+    return;
+  }
   if (connected || reconnectTimer) {
     // Intentional stop (also cancels a pending auto-reconnect).
     userStopped = true;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     stopSession();
   } else {
-    userStartSession();
+    userStartSession("voice");
   }
 });
 
@@ -1638,13 +1697,27 @@ muteBtn.addEventListener("click", () => {
   micMuted = !micMuted;
   micStream?.getAudioTracks().forEach(t => (t.enabled = !micMuted));
   muteBtn.textContent = micMuted ? "Unmute mic" : "Mute mic";
-  if (micMuted) setRingState("muted", "Mic muted");
-  else setRingState("listening", "Listening — just talk");
+  setReadyState();
 });
+
+// The "waiting on you" state depends on the mode: a voice session really is
+// listening, a text session is not — and a muted one isn't either.
+function setReadyState() {
+  if (sessionMode === "text") setRingState("texting", "Text mode — tap the ring to talk out loud");
+  else if (micMuted) setRingState("muted", "Mic muted");
+  else setRingState("listening", "Listening — just talk");
+}
 
 function setRingState(cls, text) {
   ring.className = `ring ${cls}`;
   statusEl.textContent = text;
+}
+
+function appendAssistantDelta(delta) {
+  if (!delta) return;
+  if (!currentAssistantMsg) currentAssistantMsg = addMessage("assistant", "");
+  currentAssistantMsg.textContent += delta;
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
 function addMessage(role, text) {

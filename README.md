@@ -45,10 +45,18 @@ Optionally click **Enable wake word** to say "Nova" hands-free to start a
 session (uses the browser's on-device speech recognition purely as a trigger;
 everything after the wake word is OpenAI).
 
-You can also **type to Nova** — the box under the transcript sends text into
-the same session (replies still come back as speech + transcript, and typing
-while Nova is talking interrupts her, like speaking would). Submitting while
-idle starts a session and answers your question in place of the greeting.
+You can also **type to Nova** — the box under the transcript answers in kind:
+type a question, read the answer. Typing never opens the microphone. Submitting
+while idle starts a **text session** (no mic permission, no recording
+indicator, no spoken replies) and answers your question in place of the
+greeting; the ring glows dim to show Nova is connected but not listening. Tap
+the ring to switch to talking out loud — that starts a fresh voice session, so
+Nova won't remember the typed exchange, the same as after a reconnect.
+
+Typing *during* a voice session works too: the answer comes back written
+instead of spoken, and it interrupts Nova if she's mid-sentence. Tools behave
+identically either way — "set a pasta timer for 9 minutes" works typed or
+spoken.
 
 ## Architecture
 
