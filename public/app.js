@@ -1754,7 +1754,8 @@ function setRingState(cls, text) {
 function appendAssistantDelta(delta) {
   if (!delta) return;
   if (!currentAssistantMsg) currentAssistantMsg = addMessage("assistant", "");
-  currentAssistantMsg.textContent += delta;
+  currentAssistantMsg.querySelector(".message-text")
+    ?.appendChild(document.createTextNode(delta));
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
@@ -1768,8 +1769,14 @@ function addMessage(role, text) {
     who.className = "who";
     who.textContent = role === "user" ? "You" : "Nova";
     div.appendChild(who);
+
+    const messageText = document.createElement("span");
+    messageText.className = "message-text";
+    messageText.textContent = text;
+    div.appendChild(messageText);
+  } else {
+    div.appendChild(document.createTextNode(text));
   }
-  div.appendChild(document.createTextNode(text));
   transcriptEl.appendChild(div);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
   return div;
