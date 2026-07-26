@@ -243,6 +243,7 @@ h2 {
 .msg.assistant { background: var(--panel-2); align-self: flex-start; }
 .msg.event { background: none; color: var(--muted); font-size: 12px; align-self: center; padding: 2px; }
 .msg .who { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 2px; }
+.msg .message-text { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ---- Text input (accessibility / quiet-hours / debugging path) ---- */
 
