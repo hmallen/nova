@@ -10,7 +10,7 @@
  *      locally and results returned as function_call_output items.
  */
 
-import { describeWeatherCode, formatDays, routineStepNames } from "./lib/helpers.js";
+import { describeWeatherCode, formatDays, formatElapsedTime, routineStepNames } from "./lib/helpers.js";
 
 // ---------- DOM ----------
 const ring = document.getElementById("ring");
@@ -58,6 +58,7 @@ const DEFAULT_PREFS = {
 
 const state = {
   timers: [],    // {id, kind:"timer",    label, endsAt, done}
+  stopwatches: [], // {id, kind:"stopwatch", label, startedAt}
   alarms: [],    // {id, kind:"alarm",    label, time:"HH:MM", days:[0..6]|null, done, lastFiredOn:"YYYY-MM-DD"|null}
   reminders: [], // {id, kind:"reminder", text, at:epochMs, done, missed}
   lists: {},         // synced with the server (Plan 3); localStorage is only a crash backup
@@ -175,6 +176,18 @@ function buildTools() {
   },
   {
     type: "function",
+    name: "start_stopwatch",
+    description: "Start a stopwatch that counts elapsed time upward.",
+    parameters: {
+      type: "object",
+      properties: {
+        label: { type: "string", description: "Optional name, e.g. 'workout'" },
+      },
+      required: [],
+    },
+  },
+  {
+    type: "function",
     name: "set_alarm",
     description: "Set an alarm for a specific clock time today (or tomorrow if that time already passed), optionally repeating on given weekdays.",
     parameters: {
@@ -222,7 +235,7 @@ function buildTools() {
   {
     type: "function",
     name: "cancel_timer_or_alarm",
-    description: "Cancel a timer, alarm, or reminder by its label or text, or all of them.",
+    description: "Cancel a timer, stopwatch, alarm, or reminder by its label or text, or all of them. Use this to stop a stopwatch.",
     parameters: {
       type: "object",
       properties: {
@@ -312,7 +325,7 @@ function buildTools() {
   {
     type: "function",
     name: "daily_summary",
-    description: "Get today's schedule: running timers, today's alarms, and reminders due today. " +
+    description: "Get today's schedule: running timers and stopwatches, today's alarms, and reminders due today. " +
       "Use when the user asks what their day looks like.",
     parameters: { type: "object", properties: {}, required: [] },
   },
@@ -419,6 +432,19 @@ const toolHandlers = {
     return { ok: true, label: timer.label, duration_seconds: Math.round(totalMs / 1000) };
   },
 
+  async start_stopwatch({ label }) {
+    const stopwatch = {
+      id: crypto.randomUUID(),
+      kind: "stopwatch",
+      label: String(label || "").trim() || "stopwatch",
+      startedAt: Date.now(),
+    };
+    state.stopwatches.push(stopwatch);
+    saveSchedules();
+    renderTimers();
+    return { ok: true, label: stopwatch.label };
+  },
+
   async set_alarm({ time, label, days }) {
     if (!/^\d{1,2}:\d{2}$/.test(time || "")) return { error: "Time must be HH:MM (24-hour)." };
     if (time.length === 4) time = "0" + time; // engine compares zero-padded HH:MM
@@ -478,7 +504,7 @@ const toolHandlers = {
   },
 
   async cancel_timer_or_alarm({ label }) {
-    const before = state.timers.length + state.alarms.length + state.reminders.length;
+    const before = state.timers.length + state.stopwatches.length + state.alarms.length + state.reminders.length;
     if (label) {
       const l = label.toLowerCase();
       const digits = l.replace(/\D/g, ""); // "7 am" → "7", so "cancel my 7 AM alarm" matches an unlabeled 07:00
@@ -492,18 +518,20 @@ const toolHandlers = {
           .filter(Boolean).includes(digits);
       };
       state.timers = state.timers.filter(t => !t.label.toLowerCase().includes(l));
+      state.stopwatches = state.stopwatches.filter(s => !s.label.toLowerCase().includes(l));
       state.alarms = state.alarms.filter(a => !alarmMatches(a));
       state.reminders = state.reminders.filter(r => !r.text.toLowerCase().includes(l));
     } else {
       state.timers = [];
+      state.stopwatches = [];
       state.alarms = [];
       state.reminders = [];
     }
     stopChime();
     saveSchedules();
     renderTimers();
-    const cancelled = before - (state.timers.length + state.alarms.length + state.reminders.length);
-    return cancelled ? { ok: true, cancelled } : { error: "No matching timer, alarm, or reminder found." };
+    const cancelled = before - (state.timers.length + state.stopwatches.length + state.alarms.length + state.reminders.length);
+    return cancelled ? { ok: true, cancelled } : { error: "No matching timer, stopwatch, alarm, or reminder found." };
   },
 
   async get_weather({ location }) {
@@ -679,6 +707,9 @@ const toolHandlers = {
       .filter(t => !t.done)
       .slice(0, 5)
       .map(t => ({ label: t.label, remaining_minutes: Math.max(1, Math.round((t.endsAt - Date.now()) / 60000)) }));
+    const stopwatches = state.stopwatches
+      .slice(0, 5)
+      .map(s => ({ label: s.label, elapsed: formatElapsedTime(Date.now() - s.startedAt) }));
     const alarms = state.alarms
       .filter(a => (a.days ? a.days.includes(now.getDay()) : !a.done))
       .slice(0, 5)
@@ -687,7 +718,7 @@ const toolHandlers = {
       .filter(r => !r.done && new Date(r.at).toDateString() === now.toDateString())
       .slice(0, 5)
       .map(r => ({ text: r.text, due: formatDueTime(r.at) }));
-    return { timers, alarms, reminders };
+    return { timers, stopwatches, alarms, reminders };
   },
 
   async run_routine({ name }) {
@@ -1402,7 +1433,7 @@ setInterval(() => {
     }
   }
   if (changed) saveSchedules();
-  if (changed || state.timers.some(t => !t.done)) renderTimers();
+  if (changed || state.timers.some(t => !t.done) || state.stopwatches.length) renderTimers();
 }, 500);
 
 let lastFired = null; // {kind, id, label, at} — most recent fired entry, consumed by the snooze tool
@@ -1441,7 +1472,8 @@ function onTimerFired(t) {
 
 function saveSchedules() {
   localStorage.setItem("nova.schedules", JSON.stringify({
-    timers: state.timers, alarms: state.alarms, reminders: state.reminders,
+    timers: state.timers, stopwatches: state.stopwatches,
+    alarms: state.alarms, reminders: state.reminders,
   }));
 }
 
@@ -1454,6 +1486,12 @@ function loadSchedules() {
     // ≤60 s overdue: keep — the engine loop fires it immediately (chime only
     // while disconnected). Older: drop silently.
     if (!t.done && now - t.endsAt <= 60000) state.timers.push(t);
+  }
+  for (const s of saved.stopwatches || []) {
+    if (s?.kind === "stopwatch" && typeof s.label === "string" &&
+        Number.isFinite(s.startedAt) && s.startedAt <= now) {
+      state.stopwatches.push(s);
+    }
   }
   for (const a of saved.alarms || []) {
     if (a.days || !a.done) state.alarms.push(a); // recurring alarms always survive
@@ -1740,7 +1778,7 @@ function addMessage(role, text) {
 function renderTimers() {
   const card = document.getElementById("timersCard");
   const ul = document.getElementById("timersList");
-  const entries = [...state.timers, ...state.alarms, ...state.reminders];
+  const entries = [...state.stopwatches, ...state.timers, ...state.alarms, ...state.reminders];
   card.hidden = entries.length === 0;
   ul.innerHTML = "";
   for (const t of entries) {
@@ -1750,7 +1788,9 @@ function renderTimers() {
     label.textContent = `${icon} ${t.kind === "reminder" ? t.text : t.label}`;
     const time = document.createElement("span");
     time.className = "timer-time" + (t.done || t.missed ? " timer-done" : "");
-    if (t.kind === "alarm") {
+    if (t.kind === "stopwatch") {
+      time.textContent = formatElapsedTime(Date.now() - t.startedAt);
+    } else if (t.kind === "alarm") {
       const days = t.days ? ` · ${formatDays(t.days)}` : "";
       time.textContent = t.done && !t.days ? "ringing!" : t.time + days;
     } else if (t.kind === "reminder") {

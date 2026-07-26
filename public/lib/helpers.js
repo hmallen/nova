@@ -27,3 +27,14 @@ export function formatDays(days) {
 export function routineStepNames(steps) {
   return steps.map(s => (typeof s === "string" ? s : s?.tool));
 }
+
+// Compact stopwatch display: M:SS until the first hour, then H:MM:SS.
+export function formatElapsedTime(elapsedMs) {
+  const ms = Number(elapsedMs);
+  const totalSeconds = Number.isFinite(ms) ? Math.max(0, Math.floor(ms / 1000)) : 0;
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const mm = hours ? String(minutes).padStart(2, "0") : String(minutes);
+  return `${hours ? `${hours}:` : ""}${mm}:${String(seconds).padStart(2, "0")}`;
+}
