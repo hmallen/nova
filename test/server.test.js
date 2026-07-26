@@ -4,7 +4,11 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createNovaServer } from "../server.js";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { createNovaServer, HttpsSetupError } from "../server.js";
+
+const SERVER_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../server.js");
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "nova-data-"));
@@ -33,6 +37,7 @@ function rawGet(base, rawPath) {
 
 test("server smoke", async (t) => {
   const server = createNovaServer({ env: { OPENAI_API_KEY: "sk-test" }, dataDir: tmpDataDir() });
+  assert.equal(server.novaInfo.https, false);
   const base = await listen(server);
   t.after(() => server.close());
 
@@ -140,5 +145,104 @@ test("server smoke", async (t) => {
     } finally {
       bare.close();
     }
+  });
+});
+
+test("HTTPS setup errors are actionable", async (t) => {
+  await t.test("requires HTTPS_CERT and HTTPS_KEY together", () => {
+    assert.throws(
+      () => createNovaServer({
+        env: { HTTPS_CERT: "./certs/nova.pem" },
+        dataDir: tmpDataDir(),
+      }),
+      (err) => {
+        assert.ok(err instanceof HttpsSetupError);
+        assert.match(err.message, /HTTPS_KEY is not set/);
+        assert.match(err.message, /Set both HTTPS_CERT and HTTPS_KEY/);
+        assert.match(err.message, /unset both variables to use HTTP/);
+        return true;
+      }
+    );
+  });
+
+  await t.test("identifies a missing certificate file and how to recover", () => {
+    assert.throws(
+      () => createNovaServer({
+        env: {
+          HTTPS_CERT: "./certs/does-not-exist.pem",
+          HTTPS_KEY: "./certs/does-not-exist-key.pem",
+        },
+        dataDir: tmpDataDir(),
+      }),
+      (err) => {
+        assert.ok(err instanceof HttpsSetupError);
+        assert.match(err.message, /HTTPS_CERT/);
+        assert.match(err.message, /does-not-exist\.pem/);
+        assert.match(err.message, /could not be read \(ENOENT\)/);
+        assert.match(err.message, /mkcert/);
+        return true;
+      }
+    );
+  });
+
+  await t.test("identifies an unreadable key path", () => {
+    const dir = tmpDataDir();
+    const certPath = path.join(dir, "cert.pem");
+    const keyPath = path.join(dir, "key-is-a-directory");
+    fs.writeFileSync(certPath, "test-only placeholder");
+    fs.mkdirSync(keyPath);
+
+    assert.throws(
+      () => createNovaServer({
+        env: { HTTPS_CERT: certPath, HTTPS_KEY: keyPath },
+        dataDir: path.join(dir, "data"),
+      }),
+      (err) => {
+        assert.ok(err instanceof HttpsSetupError);
+        assert.match(err.message, /HTTPS_KEY/);
+        assert.match(err.message, /could not be read/);
+        assert.match(err.message, /file permissions/);
+        return true;
+      }
+    );
+  });
+
+  await t.test("rejects invalid PEM contents with a setup error", () => {
+    const dir = tmpDataDir();
+    const certPath = path.join(dir, "cert.pem");
+    const keyPath = path.join(dir, "key.pem");
+    fs.writeFileSync(certPath, "not a certificate");
+    fs.writeFileSync(keyPath, "not a private key");
+
+    assert.throws(
+      () => createNovaServer({
+        env: { HTTPS_CERT: certPath, HTTPS_KEY: keyPath },
+        dataDir: path.join(dir, "data"),
+      }),
+      (err) => {
+        assert.ok(err instanceof HttpsSetupError);
+        assert.match(err.message, /valid PEM certificate and private-key pair/);
+        assert.match(err.message, /Regenerate both files with mkcert/);
+        return true;
+      }
+    );
+  });
+
+  await t.test("direct startup prints the setup error without a stack trace", () => {
+    const result = spawnSync(process.execPath, [SERVER_PATH], {
+      cwd: path.dirname(SERVER_PATH),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HTTPS_CERT: "./certs/does-not-exist.pem",
+        HTTPS_KEY: "./certs/does-not-exist-key.pem",
+      },
+    });
+
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /HTTPS setup error: HTTPS_CERT/);
+    assert.match(result.stderr, /mkcert/);
+    assert.doesNotMatch(result.stderr, /\n\s+at /);
   });
 });

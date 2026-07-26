@@ -164,13 +164,19 @@ real assistant appliance. The one real blocker for a second device is that
 
 2. Point `.env` at the two generated files (`HTTPS_CERT=./certs/<...>.pem`,
    `HTTPS_KEY=./certs/<...>-key.pem`) and restart — the server now prints its
-   LAN `https://` URLs at boot.
+   LAN `https://` URLs at boot. Both variables are required together. If a
+   path is missing, unreadable, or not valid PEM, Nova exits with a focused
+   setup error that tells you whether to regenerate/fix the files or remove
+   both settings to run locally over HTTP.
 3. Install the mkcert root CA on the tablet/phone (mkcert's documented mobile
    flow: `mkcert -CAROOT`, copy `rootCA.pem` over, trust it in settings).
    A plain self-signed cert without a trusted CA fails silently for service
    workers — don't bother.
 4. Open `https://<lan-ip>:3000` on the device, allow the mic, and use
    **Add to Home Screen** for the full-screen app.
+
+`.env` and the entire `certs/` directory are ignored by Git. Keep generated
+certificates—especially private keys—machine-local; never force-add them.
 
 Loading over plain `http://` from a second device shows "Needs HTTPS for the
 microphone" instead of a dead mic prompt. The service worker only pre-caches
