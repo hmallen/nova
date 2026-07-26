@@ -2,7 +2,7 @@
 
 A hands-free household voice assistant in the spirit of Amazon Alexa, built
 entirely on OpenAI's latest-generation voice stack. Speak naturally, interrupt
-it mid-sentence, and ask it to set timers, check the weather, manage lists,
+it mid-sentence, and ask it to start stopwatches, set timers, check the weather, manage lists,
 control (simulated) smart-home devices, play ambient sounds, or just chat.
 
 ## Quick start
@@ -20,6 +20,7 @@ npm start
 Try:
 
 - "What time is it?" / "What's the date?"
+- "Start a stopwatch" · "Stop the stopwatch"
 - "Set a pasta timer for 8 minutes" · "Cancel the pasta timer"
 - "Set an alarm for 7:30 tomorrow morning"
 - "Wake me at 7 on weekdays" — repeating alarms survive page refreshes
@@ -34,7 +35,7 @@ Try:
 - "Good morning" — runs a routine: weather, today's schedule, and a short
   news briefing as one flowing update ("Good night" ends with rain sounds)
 - "What's in the news?" · "Any news about space?" — keyless RSS headlines
-- "What does my day look like?" — timers, today's alarms, reminders due today
+- "What does my day look like?" — running stopwatches and timers, today's alarms, reminders due today
 - "Add the news to my good night routine" · "What are my routines?"
 - "Remember that I live in Portland" · "Call me Sam" · "Use celsius" —
   preferences persist and are honored next session ("What do you know about me?")
@@ -79,13 +80,13 @@ Browser ──(mic audio via WebRTC)──────────► OpenAI Rea
   events over the `oai-events` data channel, registers tools via
   `session.update`, executes function calls locally, and returns results as
   `function_call_output` items followed by `response.create`.
-- **Skills (tools)** — `get_current_datetime`, `set_timer`, `set_alarm`
+- **Skills (tools)** — `get_current_datetime`, `start_stopwatch`, `set_timer`, `set_alarm`
   (one-time or repeating on chosen weekdays), `set_reminder`, `snooze`,
   `cancel_timer_or_alarm`, `get_weather` (Open-Meteo, no key needed),
   `manage_list`, `control_device` (simulated smart home), `play_ambient_sound`
   (rain / white noise / ocean, synthesized with Web Audio), `stop_ambient_sound`,
   `set_volume`, `manage_preferences`. Device states, preferences, and
-  timers/alarms/reminders persist in `localStorage`.
+  stopwatches/timers/alarms/reminders persist in `localStorage`.
 - **Routines** — saved skill sequences in `localStorage` (seeded with
   "good morning" and "good night"), editable by voice via `manage_routine`.
   `run_routine` executes the steps locally and returns one composite result,
@@ -102,6 +103,8 @@ Browser ──(mic audio via WebRTC)──────────► OpenAI Rea
   reminders as "This is your reminder to …". They survive page refreshes;
   reminders that come due while the page is closed show as "missed" and are
   announced once at the start of the next session.
+- **Stopwatches** count upward in the same timekeeping card and survive page
+  refreshes until stopped.
 
 ## Real integrations (all optional, env-gated)
 
