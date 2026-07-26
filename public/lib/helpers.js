@@ -38,3 +38,10 @@ export function formatElapsedTime(elapsedMs) {
   const mm = hours ? String(minutes).padStart(2, "0") : String(minutes);
   return `${hours ? `${hours}:` : ""}${mm}:${String(seconds).padStart(2, "0")}`;
 }
+
+// User-selected Smart Home entities are stored as stable string keys. Keep
+// malformed or repeated localStorage values from leaking into the UI.
+export function normalizePinnedDeviceKeys(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter(key => typeof key === "string" && key.trim()).map(key => key.trim()))];
+}

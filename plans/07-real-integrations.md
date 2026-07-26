@@ -63,9 +63,11 @@ Never expose the token; the browser talks only to these:
 
 - When `config.homeAssistant`:
   - Boot + every 30 s (visible only): fetch `/api/ha/states` into
-    `state.devices` keyed by lowercase friendly name:
-    `{ entity_id, domain, on, value? }`. `renderDevices` needs only the
-    `value` suffix tweak (`°` for climate).
+    `state.devices` keyed by stable entity id:
+    `{ name, entity_id, domain, on, value? }`.
+  - The Smart Home card renders only entity ids explicitly pinned in the
+    browser. The pin list starts empty, persists in localStorage, and does not
+    limit which devices remain available to `control_device`.
   - `control_device` handler: same name-matching logic as today
     (substring both ways, "all lights" → all `light.` domain entities), then
     `POST /api/ha/call` per target:

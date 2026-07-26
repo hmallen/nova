@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatElapsedTime } from "../public/lib/helpers.js";
+import { formatElapsedTime, normalizePinnedDeviceKeys } from "../public/lib/helpers.js";
 
 test("formatElapsedTime renders stopwatch durations", () => {
   assert.equal(formatElapsedTime(0), "0:00");
@@ -8,4 +8,12 @@ test("formatElapsedTime renders stopwatch durations", () => {
   assert.equal(formatElapsedTime(3_661_000), "1:01:01");
   assert.equal(formatElapsedTime(-1_000), "0:00");
   assert.equal(formatElapsedTime(Number.NaN), "0:00");
+});
+
+test("normalizePinnedDeviceKeys keeps unique, usable entity keys", () => {
+  assert.deepEqual(normalizePinnedDeviceKeys(null), []);
+  assert.deepEqual(
+    normalizePinnedDeviceKeys(["light.office", "", 42, " light.office ", "fan.bedroom"]),
+    ["light.office", "fan.bedroom"]
+  );
 });

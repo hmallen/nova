@@ -51,8 +51,22 @@
         <h2>Lists <span id="listsOfflineBadge" class="offline-badge" hidden>offline — changes saved locally</span></h2>
         <div id="listsBody"></div>
       </div>
-      <div class="card">
-        <h2>Smart Home</h2>
+      <div class="card" id="devicesCard">
+        <div class="card-heading">
+          <h2>Smart Home</h2>
+          <button id="manageDevicesBtn" class="text-button" type="button" aria-expanded="false" aria-controls="devicePicker">
+            Add entity
+          </button>
+        </div>
+        <form id="devicePicker" class="device-picker" hidden>
+          <label for="deviceSelect">Entity</label>
+          <div class="device-picker-controls">
+            <select id="deviceSelect"></select>
+            <button id="addDeviceBtn" class="pill" type="submit">Add</button>
+          </div>
+          <p id="devicePickerHint" class="device-picker-hint" aria-live="polite"></p>
+        </form>
+        <p id="devicesEmpty" class="devices-empty">No entities added. Choose the devices you want to keep an eye on.</p>
         <div id="devicesBody" class="devices"></div>
       </div>
     </section>

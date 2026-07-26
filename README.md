@@ -119,12 +119,15 @@ and only registers the matching tools.
 Set `HA_URL` and `HA_TOKEN` (a long-lived access token from your HA profile
 page). `control_device` then drives real `light` / `switch` / `fan` /
 `climate` entities by friendly name ("turn on the office light", "set the
-thermostat to 21"), the Smart Home card mirrors real states (refreshed every
-30 s), and the server proxy validates every call hard — domains, services,
-entity ids, and data are allowlisted, so the browser can never use the
-full-admin token as a generic passthrough. Light brightness is out of scope
-for now: Nova says she can only switch lights on and off. Without the env
-vars, devices stay simulated exactly as before.
+thermostat to 21"). The Smart Home card starts empty; use **Add entity** to
+pin only the states you want visible. Those choices stay in this browser and
+their states refresh every 30 s. Pinning only affects the dashboard — Nova
+can still control every available entity by voice. The server proxy validates
+every call hard — domains, services, entity ids, and data are allowlisted, so
+the browser can never use the full-admin token as a generic passthrough.
+Light brightness is out of scope for now: Nova says she can only switch
+lights on and off. Without the env vars, devices stay simulated exactly as
+before and can be pinned the same way.
 
 ### Calendar (read-only ICS)
 
