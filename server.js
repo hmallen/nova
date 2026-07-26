@@ -27,6 +27,48 @@ import { sanitizePrefs, buildAboutBlock } from "./lib/prefs.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
 
+export class HttpsSetupError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "HttpsSetupError";
+  }
+}
+
+function loadHttpsOptions(env) {
+  const certPath = String(env.HTTPS_CERT || "").trim();
+  const keyPath = String(env.HTTPS_KEY || "").trim();
+
+  if (!certPath && !keyPath) return null;
+  if (!certPath || !keyPath) {
+    const missing = certPath ? "HTTPS_KEY" : "HTTPS_CERT";
+    throw new HttpsSetupError(
+      `HTTPS setup error: ${missing} is not set. Set both HTTPS_CERT and HTTPS_KEY ` +
+      `to readable local PEM files (see README "Use it on a tablet or phone"), ` +
+      `or unset both variables to use HTTP on localhost.`
+    );
+  }
+
+  const readConfiguredFile = (variable, configuredPath) => {
+    try {
+      return readFileSync(path.resolve(__dirname, configuredPath));
+    } catch (cause) {
+      const reason = cause?.code ? ` (${cause.code})` : "";
+      throw new HttpsSetupError(
+        `HTTPS setup error: ${variable} points to "${configuredPath}", but that file ` +
+        `could not be read${reason}. Generate local certificates with mkcert and update ` +
+        `HTTPS_CERT/HTTPS_KEY in .env, fix the file permissions, or unset both variables ` +
+        `to use HTTP on localhost.`,
+        { cause }
+      );
+    }
+  };
+
+  return {
+    cert: readConfiguredFile("HTTPS_CERT", certPath),
+    key: readConfiguredFile("HTTPS_KEY", keyPath),
+  };
+}
+
 const INSTRUCTIONS = `
 You are Nova, a friendly household voice assistant in the style of Amazon Alexa.
 
@@ -113,6 +155,7 @@ const MIME = {
 };
 
 export function createNovaServer({ env = process.env, dataDir = path.join(__dirname, "data") } = {}) {
+  const httpsOptions = loadHttpsOptions(env);
   const OPENAI_API_KEY = env.OPENAI_API_KEY;
   // Latest generation realtime speech-to-speech model (July 2026).
   // Override with REALTIME_MODEL=gpt-realtime-2.1-mini for lower cost/latency.
@@ -454,13 +497,21 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
   // HTTPS is optional but required for any second device on the LAN: mic
   // access (and the wake word) needs a secure context, and only localhost
   // gets one over plain HTTP. See README "Use it on a tablet or phone".
-  const useHttps = Boolean(env.HTTPS_CERT && env.HTTPS_KEY);
-  const server = useHttps
-    ? https.createServer({
-        cert: readFileSync(path.resolve(__dirname, env.HTTPS_CERT)),
-        key: readFileSync(path.resolve(__dirname, env.HTTPS_KEY)),
-      }, requestHandler)
-    : http.createServer(requestHandler);
+  const useHttps = Boolean(httpsOptions);
+  let server;
+  try {
+    server = useHttps
+      ? https.createServer(httpsOptions, requestHandler)
+      : http.createServer(requestHandler);
+  } catch (cause) {
+    const reason = cause?.code ? ` (${cause.code})` : "";
+    throw new HttpsSetupError(
+      `HTTPS setup error: HTTPS_CERT/HTTPS_KEY could not be loaded as a valid PEM ` +
+      `certificate and private-key pair${reason}. Regenerate both files with mkcert ` +
+      `and update .env, or unset both variables to use HTTP on localhost.`,
+      { cause }
+    );
+  }
 
   // Non-secret facts the boot logging (and tests) may want.
   server.novaInfo = {
@@ -478,23 +529,29 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   if (existsSync(envPath)) applyEnv(parseEnv(readFileSync(envPath, "utf8")), process.env);
 
   const PORT = Number(process.env.PORT || 3000);
-  const server = createNovaServer();
-  server.listen(PORT, () => {
-    const { model, voice, https: tls, hasKey } = server.novaInfo;
-    const proto = tls ? "https" : "http";
-    console.log(`\n  Nova voice assistant`);
-    console.log(`  → ${proto}://localhost:${PORT}`);
-    if (tls) {
-      // Show LAN addresses so the user knows what to type on the tablet.
-      for (const addrs of Object.values(os.networkInterfaces())) {
-        for (const a of addrs || []) {
-          if (a.family === "IPv4" && !a.internal) console.log(`  → ${proto}://${a.address}:${PORT}  (LAN)`);
+  try {
+    const server = createNovaServer();
+    server.listen(PORT, () => {
+      const { model, voice, https: tls, hasKey } = server.novaInfo;
+      const proto = tls ? "https" : "http";
+      console.log(`\n  Nova voice assistant`);
+      console.log(`  → ${proto}://localhost:${PORT}`);
+      if (tls) {
+        // Show LAN addresses so the user knows what to type on the tablet.
+        for (const addrs of Object.values(os.networkInterfaces())) {
+          for (const a of addrs || []) {
+            if (a.family === "IPv4" && !a.internal) console.log(`  → ${proto}://${a.address}:${PORT}  (LAN)`);
+          }
         }
       }
-    }
-    console.log(`  model: ${model}, voice: ${voice}`);
-    if (!hasKey) {
-      console.warn(`\n  ⚠  OPENAI_API_KEY not set — copy .env.example to .env and add your key.\n`);
-    }
-  });
+      console.log(`  model: ${model}, voice: ${voice}`);
+      if (!hasKey) {
+        console.warn(`\n  ⚠  OPENAI_API_KEY not set — copy .env.example to .env and add your key.\n`);
+      }
+    });
+  } catch (err) {
+    if (!(err instanceof HttpsSetupError)) throw err;
+    console.error(`\n  ✖ ${err.message}\n`);
+    process.exitCode = 1;
+  }
 }
