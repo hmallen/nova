@@ -188,6 +188,32 @@ h2 {
   padding: 16px;
 }
 
+.card-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.card-heading h2 { margin-bottom: 10px; }
+
+.text-button {
+  appearance: none;
+  border: 0;
+  background: none;
+  color: var(--cyan);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 2px 0;
+}
+.text-button:hover { color: #7dd3fc; }
+.text-button:focus-visible,
+.device-remove:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+
 .card ul { list-style: none; }
 .card li { padding: 5px 0; font-size: 14px; display: flex; justify-content: space-between; gap: 8px; }
 
@@ -211,7 +237,60 @@ h2 {
 #weatherBody { font-size: 14px; line-height: 1.6; color: #c5d0de; }
 #weatherBody .temp { font-size: 30px; color: var(--text); font-weight: 300; }
 
-/* smart home device chips */
+/* smart home entity picker + device chips */
+.device-picker {
+  border-top: 1px solid #263349;
+  margin: 2px 0 12px;
+  padding-top: 12px;
+}
+
+.device-picker label {
+  color: #c5d0de;
+  display: block;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.device-picker-controls { display: flex; gap: 8px; }
+
+.device-picker select {
+  background: var(--panel-2);
+  border: 1px solid #263349;
+  border-radius: 8px;
+  color: var(--text);
+  flex: 1;
+  font: inherit;
+  font-size: 13px;
+  min-width: 0;
+  padding: 7px 10px;
+}
+
+.device-picker select:focus-visible {
+  border-color: var(--cyan);
+  outline: 2px solid rgba(0, 212, 255, 0.25);
+  outline-offset: 1px;
+}
+
+.device-picker select:disabled,
+.device-picker .pill:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.device-picker-hint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  margin-top: 7px;
+}
+
+.devices-empty {
+  color: #a9b5c5;
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 52ch;
+}
+
 .devices { display: flex; flex-wrap: wrap; gap: 8px; }
 .device {
   border: 1px solid #263349;
@@ -225,10 +304,30 @@ h2 {
   gap: 7px;
   transition: all 0.25s;
 }
+.device.unavailable { border-style: dashed; }
 .device .dot { width: 8px; height: 8px; border-radius: 50%; background: #3a4a63; transition: all 0.25s; }
 .device.on { color: var(--text); border-color: rgba(52, 211, 153, 0.5); }
 .device.on .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
 .device .val { color: var(--cyan); }
+.device-remove {
+  align-items: center;
+  appearance: none;
+  background: none;
+  border: 0;
+  border-radius: 50%;
+  color: #9cabbf;
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 17px;
+  height: 20px;
+  justify-content: center;
+  line-height: 1;
+  margin: -2px -5px -2px 2px;
+  padding: 0;
+  width: 20px;
+}
+.device-remove:hover { background: #2a3548; color: var(--text); }
 
 /* ---- Transcript ---- */
 
@@ -268,4 +367,6 @@ h2 {
   :root { --ring-size: 150px; }
   main { padding-top: 16px; }
   .transcript { max-height: 240px; }
+  .device-picker-controls { align-items: stretch; flex-direction: column; }
+  .device-picker .pill { align-self: flex-start; }
 }

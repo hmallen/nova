@@ -10,7 +10,13 @@
  *      locally and results returned as function_call_output items.
  */
 
-import { describeWeatherCode, formatDays, formatElapsedTime, routineStepNames } from "./lib/helpers.js";
+import {
+  describeWeatherCode,
+  formatDays,
+  formatElapsedTime,
+  normalizePinnedDeviceKeys,
+  routineStepNames,
+} from "./lib/helpers.js";
 
 // ---------- DOM ----------
 const ring = document.getElementById("ring");
@@ -20,6 +26,11 @@ const wakeBtn = document.getElementById("wakeBtn");
 const wakeHint = document.getElementById("wakeHint");
 const transcriptEl = document.getElementById("transcript");
 const assistantAudio = document.getElementById("assistantAudio");
+const manageDevicesBtn = document.getElementById("manageDevicesBtn");
+const devicePicker = document.getElementById("devicePicker");
+const deviceSelect = document.getElementById("deviceSelect");
+const addDeviceBtn = document.getElementById("addDeviceBtn");
+const devicePickerHint = document.getElementById("devicePickerHint");
 
 // ---------- Session state ----------
 let pc = null;          // RTCPeerConnection
@@ -56,6 +67,16 @@ const DEFAULT_PREFS = {
   voice: null,         // null = server default
 };
 
+const PINNED_DEVICES_KEY = "nova.smartHome.pinnedEntities";
+
+function loadPinnedDeviceKeys() {
+  try {
+    return normalizePinnedDeviceKeys(JSON.parse(localStorage.getItem(PINNED_DEVICES_KEY) || "null"));
+  } catch {
+    return [];
+  }
+}
+
 const state = {
   timers: [],    // {id, kind:"timer",    label, endsAt, done}
   stopwatches: [], // {id, kind:"stopwatch", label, startedAt}
@@ -71,12 +92,25 @@ const state = {
     "fan": { on: false },
     "thermostat": { on: true, value: 70 },
   },
+  pinnedDeviceKeys: loadPinnedDeviceKeys(),
   volume: 8, // 0-10
   prefs: { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem("nova.prefs") || "null") },
 };
 
 function savePrefs() {
   localStorage.setItem("nova.prefs", JSON.stringify(state.prefs));
+}
+
+function deviceName(key, device) {
+  return device?.name || key;
+}
+
+function availableDeviceNames() {
+  return Object.entries(state.devices).map(([key, device]) => deviceName(key, device));
+}
+
+function savePinnedDevices() {
+  localStorage.setItem(PINNED_DEVICES_KEY, JSON.stringify(state.pinnedDeviceKeys));
 }
 
 // ---------- Routines (Plan 4) ----------
@@ -276,7 +310,7 @@ function buildTools() {
     description: (appConfig.homeAssistant
       ? "Control a smart-home device via Home Assistant."
       : "Control a simulated smart-home device.") +
-      " Devices: " + Object.keys(state.devices).join(", ") + ".",
+      " Devices: " + availableDeviceNames().join(", ") + ".",
     parameters: {
       type: "object",
       properties: {
@@ -598,21 +632,22 @@ const toolHandlers = {
     const d = (device || "").toLowerCase();
     const targets = [];
     if (d === "all lights" || d === "the lights" || d === "lights") {
-      for (const [name, dev] of Object.entries(state.devices)) {
-        if (appConfig.homeAssistant ? dev.domain === "light" : name.includes("light")) targets.push(name);
+      for (const [key, dev] of Object.entries(state.devices)) {
+        if (appConfig.homeAssistant ? dev.domain === "light" : deviceName(key, dev).includes("light")) targets.push(key);
       }
     } else {
       // Duplicate friendly names match together and are acted on together —
       // that's the "all lights" semantics users expect.
-      for (const name of Object.keys(state.devices)) {
-        if (name.includes(d) || d.includes(name)) targets.push(name);
+      for (const [key, dev] of Object.entries(state.devices)) {
+        const name = deviceName(key, dev);
+        if (name.includes(d) || d.includes(name)) targets.push(key);
       }
     }
-    if (!targets.length) return { error: `No device called "${device}". Devices: ${Object.keys(state.devices).join(", ")}.` };
+    if (!targets.length) return { error: `No device called "${device}". Devices: ${availableDeviceNames().join(", ")}.` };
 
     if (appConfig.homeAssistant) {
-      for (const name of targets) {
-        const dev = state.devices[name];
+      for (const key of targets) {
+        const dev = state.devices[key];
         let call;
         if (action === "on") call = { domain: dev.domain, service: "turn_on", entity_id: dev.entity_id };
         else if (action === "off") call = { domain: dev.domain, service: "turn_off", entity_id: dev.entity_id };
@@ -633,18 +668,18 @@ const toolHandlers = {
       }
       // HA is authoritative; don't trust optimistic state.
       await refreshHaStates().catch(() => {});
-      return { ok: true, devices: targets, action, value };
+      return { ok: true, devices: targets.map(key => deviceName(key, state.devices[key])), action, value };
     }
 
-    for (const name of targets) {
-      const dev = state.devices[name];
+    for (const key of targets) {
+      const dev = state.devices[key];
       if (action === "on") dev.on = true;
       else if (action === "off") dev.on = false;
       else if (action === "set" && typeof value === "number") { dev.value = value; dev.on = true; }
     }
     localStorage.setItem("nova.devices", JSON.stringify(state.devices));
     renderDevices();
-    return { ok: true, devices: targets, action, value };
+    return { ok: true, devices: targets.map(key => deviceName(key, state.devices[key])), action, value };
   },
 
   async play_ambient_sound({ sound }) {
@@ -859,7 +894,8 @@ async function refreshHaStates() {
   const entities = await resp.json();
   const devices = {};
   for (const e of entities) {
-    devices[String(e.name).toLowerCase()] = {
+    devices[e.entity_id] = {
+      name: String(e.name).toLowerCase(),
       entity_id: e.entity_id,
       domain: e.domain,
       on: e.state !== "off" && e.state !== "unavailable" && e.state !== "unknown",
@@ -1860,23 +1896,96 @@ function renderLists() {
 
 function renderDevices() {
   const body = document.getElementById("devicesBody");
+  const empty = document.getElementById("devicesEmpty");
   body.innerHTML = "";
-  for (const [name, dev] of Object.entries(state.devices)) {
+  const availableByKey = new Map(Object.entries(state.devices));
+  for (const key of state.pinnedDeviceKeys) {
+    const dev = availableByKey.get(key);
+    const name = deviceName(key, dev);
     const chip = document.createElement("div");
-    chip.className = "device" + (dev.on ? " on" : "");
+    chip.className = "device" + (dev?.on ? " on" : "") + (!dev ? " unavailable" : "");
+    chip.setAttribute("aria-label", `${name}, ${dev ? (dev.on ? "on" : "off") : "unavailable"}`);
     const dot = document.createElement("span");
     dot.className = "dot";
+    dot.setAttribute("aria-hidden", "true");
     chip.appendChild(dot);
     chip.appendChild(document.createTextNode(name));
-    if (typeof dev.value === "number") {
+    if (typeof dev?.value === "number") {
       const val = document.createElement("span");
       val.className = "val";
       val.textContent = `${dev.value}°`;
       chip.appendChild(val);
     }
+    const remove = document.createElement("button");
+    remove.className = "device-remove";
+    remove.type = "button";
+    remove.setAttribute("aria-label", `Remove ${name} from Smart Home`);
+    remove.title = `Remove ${name}`;
+    remove.textContent = "×";
+    remove.addEventListener("click", () => {
+      state.pinnedDeviceKeys = state.pinnedDeviceKeys.filter(pinned => pinned !== key);
+      savePinnedDevices();
+      renderDevices();
+    });
+    chip.appendChild(remove);
     body.appendChild(chip);
   }
+  empty.hidden = state.pinnedDeviceKeys.length > 0;
+  syncDevicePicker();
 }
+
+function syncDevicePicker() {
+  const pinned = new Set(state.pinnedDeviceKeys);
+  const unpinned = Object.entries(state.devices)
+    .filter(([key]) => !pinned.has(key))
+    .sort(([keyA, devA], [keyB, devB]) =>
+      deviceName(keyA, devA).localeCompare(deviceName(keyB, devB))
+    );
+  deviceSelect.innerHTML = "";
+  if (!unpinned.length) {
+    const option = document.createElement("option");
+    option.textContent = "All available entities are already shown";
+    option.value = "";
+    deviceSelect.appendChild(option);
+  } else {
+    for (const [key, dev] of unpinned) {
+      const option = document.createElement("option");
+      option.value = key;
+      const name = deviceName(key, dev);
+      option.textContent = dev.entity_id ? `${name} · ${dev.entity_id}` : name;
+      deviceSelect.appendChild(option);
+    }
+  }
+  deviceSelect.disabled = unpinned.length === 0;
+  addDeviceBtn.disabled = unpinned.length === 0;
+  devicePickerHint.textContent = unpinned.length
+    ? `${unpinned.length} ${unpinned.length === 1 ? "entity" : "entities"} available`
+    : "Remove an entity before adding another.";
+}
+
+function setDevicePickerOpen(open) {
+  devicePicker.hidden = !open;
+  manageDevicesBtn.textContent = open ? "Done" : "Add entity";
+  manageDevicesBtn.setAttribute("aria-expanded", String(open));
+  if (open) {
+    syncDevicePicker();
+    deviceSelect.focus();
+  }
+}
+
+manageDevicesBtn.addEventListener("click", () => {
+  setDevicePickerOpen(devicePicker.hidden);
+});
+
+devicePicker.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const key = deviceSelect.value;
+  if (!key || state.pinnedDeviceKeys.includes(key)) return;
+  state.pinnedDeviceKeys.push(key);
+  savePinnedDevices();
+  renderDevices();
+  if (!deviceSelect.disabled) deviceSelect.focus();
+});
 
 // =====================================================================
 // PWA (Plan 6)
