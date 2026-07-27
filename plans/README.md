@@ -1,6 +1,6 @@
 # Nova — Implementation Plans
 
-Eight plans covering the agreed feature roadmap. Each plan is an independently
+Ten plans covering the agreed feature roadmap. Each plan is an independently
 shippable unit of work with its own verification steps. Dependencies between
 plans are listed below; within a tier, plans can be built in any order or in
 parallel.
@@ -15,6 +15,8 @@ parallel.
 | 6 | [PWA & mobile support](06-pwa-and-mobile.md) | — | S |
 | 7 | [Real integrations: Home Assistant, calendar, radio](07-real-integrations.md) | 3 (patterns) | L |
 | 8 | [Project hygiene: tests, CI, Docker](08-project-hygiene.md) | best last-ish | S |
+| 9 | [Persistent memory: profile facts & session rollover](09-persistent-memory.md) | 2, 3, 5 | L |
+| 10 | [Memory archive & learned habits](10-memory-archive-and-habits.md) | 9, 3, 4 (soft) | L |
 
 ## Suggested order
 
@@ -29,6 +31,14 @@ parallel.
 4. **Plan 8 (hygiene)** can start any time — the test harness and CI are more
    valuable the earlier they land, but the Docker piece should wait until the
    `data/` directory from Plan 3 exists so the volume mount is right.
+5. **Plans 9 and 10 (memory)** come last of the feature work, and are two
+   halves of one four-tier design — Plan 9 covers what Nova always knows
+   (facts in the prompt, conversation carried across reconnects), Plan 10
+   covers what it can look up or notice (an on-demand archive, learned
+   habits). Plan 9 extends Plan 2's About-the-user block and Plan 3's file
+   store, and its rollover layer needs Plan 5's reconnect path. Plan 10 builds
+   on Plan 9's store and provenance conventions and should not start until
+   Plan 9 has landed. All four tiers ship separately, in order.
 
 ## Shared conventions (apply to every plan)
 
