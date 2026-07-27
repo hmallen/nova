@@ -411,6 +411,24 @@ function buildTools() {
   },
   {
     type: "function",
+    name: "remember",
+    description: "Save, list, or forget an open-ended fact about the household — allergies, " +
+      "family members, habits, anything that doesn't fit a set preference field. Use when the " +
+      "user says 'remember that…', 'don't forget…', 'forget that…'. For their name, home city, " +
+      "temperature units, or your voice, use manage_preferences instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["add", "list", "forget"] },
+        text: { type: "string", description: "add: the fact in your own words, one short sentence" },
+        replaces: { type: "string", description: "add: id of the fact this one supersedes" },
+        id: { type: "string", description: "forget: id of the fact to forget" },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    type: "function",
     name: "set_volume",
     description: "Set the assistant's speaker volume from 0 (mute) to 10 (max), or adjust up/down.",
     parameters: {
@@ -774,6 +792,9 @@ const toolHandlers = {
         results.push({ step: String(tool), error: "This skill isn't allowed in routines." });
         continue;
       }
+      // Steps run through the handlers directly, so runTool never sees them —
+      // record each one here or the rollover filter would miss a news step.
+      pendingTools.push(tool);
       try {
         results.push({ step: tool, result: await toolHandlers[tool](args) });
       } catch (err) {
@@ -872,6 +893,31 @@ const toolHandlers = {
     savePrefs();
     if (!changed) return { prefs: speakable(), note: "nothing changed" };
     return { ok: true, prefs: speakable(), ...(note ? { note } : {}) };
+  },
+
+  // Facts live server-side (Plan 9), unlike preferences: shared across every
+  // device in the house, and never posted from the browser into the prompt.
+  async remember({ action, text, replaces, id }) {
+    const call = async (init) => {
+      let resp;
+      try {
+        resp = await fetch("/api/memory/facts", init);
+      } catch {
+        return { error: "I can't reach my memory right now — nothing was saved." };
+      }
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) return { error: body.error || `Memory is unavailable (HTTP ${resp.status}).` };
+      return body;
+    };
+    if (action === "list") return call({});
+    if (action === "add" || action === "forget") {
+      return call({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, text, replaces, id }),
+      });
+    }
+    return { error: "Unknown action." };
   },
 
   async set_volume({ level, direction }) {
@@ -1092,6 +1138,9 @@ async function startSession() {
     const tokenBody = await tokenResp.json();
     if (!tokenResp.ok) throw new Error(tokenBody.error || "Could not create session");
     const EPHEMERAL_KEY = tokenBody.value;
+    // The tail of the last conversation, if it's recent enough to still be
+    // worth replaying — the server decides that, and renders the text.
+    pendingRollover = tokenBody.rollover || null;
 
     // 2. Peer connection: mic up, assistant audio down. A text session skips
     //    getUserMedia entirely — no permission prompt, no recording indicator
@@ -1247,6 +1296,24 @@ async function onDataChannelOpen() {
     for (const r of missed) r.done = true; // stays rendered as "missed", but only announced once
     saveSchedules();
   }
+  // Where the last conversation left off (Plan 9), as one item rather than one
+  // per turn: the token budget stays in one place, and a single framed block
+  // keeps the model from adopting a replayed turn's modality.
+  const rollover = pendingRollover;
+  pendingRollover = null;
+  if (rollover?.text) {
+    sendEvent({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: ROLLOVER_ROLE,
+        content: [{
+          type: "input_text",
+          text: ROLLOVER_ROLE === "user" ? `[system event] ${rollover.text}` : rollover.text,
+        }],
+      },
+    });
+  }
   const typed = pendingTypedMessage;
   pendingTypedMessage = null;
   const reconnected = wasReconnect;
@@ -1254,6 +1321,9 @@ async function onDataChannelOpen() {
   if (typed) {
     // The user asked a question by keyboard; answering it IS the greeting.
     sendTypedMessage(typed);
+  } else if (rollover?.text) {
+    // Nova already has the context — no apology and no recap, just be ready.
+    createResponse();
   } else if (reconnected) {
     createResponse({ instructions: "Say only: 'Sorry, I lost you for a second.'" });
   } else {
@@ -1290,6 +1360,7 @@ function createResponse({ textOnly = sessionMode === "text", instructions } = {}
 function sendTypedMessage(text) {
   if (assistantSpeaking) sendEvent({ type: "response.cancel" }); // typed barge-in
   addMessage("user", text);
+  recordTurn("user", text); // no transcription event fires for typed input
   sendEvent({
     type: "conversation.item.create",
     item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
@@ -1321,6 +1392,10 @@ textForm.addEventListener("submit", (e) => {
 function teardown() {
   connected = false;
   assistantSpeaking = false;
+  // Get the tail on the server now — the next session may be seconds away.
+  if (rolloverFlushTimer) { clearTimeout(rolloverFlushTimer); rolloverFlushTimer = null; }
+  pendingTools = [];
+  flushRollover();
   try { dc?.close(); } catch {}
   try { pc?.close(); } catch {}
   micStream?.getTracks().forEach(t => t.stop());
@@ -1336,6 +1411,73 @@ function stopSession(message = "Tap the ring to wake Nova") {
   if (wakeEnabled) startWakeListening();
 }
 
+// ---------- Session rollover (Plan 9) ----------
+// The tail of the conversation, mirrored to the server so a brand-new session
+// — after a drop, a reload, or the Realtime API's hourly cap — can pick up
+// where this one left off. Text only: assistant audio can't be loaded back
+// into a session at all, and text costs roughly a tenth of the same audio.
+//
+// The buffer deliberately outlives a single session. A reconnect is a new
+// Realtime session but the same conversation, and the browser is the only
+// thing that sees both halves.
+
+const ROLLOVER_TURNS = 8;
+const ROLLOVER_FLUSH_MS = 5000;
+
+let turnBuffer = [];        // { role, text, tools, mode }
+let pendingTools = [];      // tools that ran while the current reply was being built
+let rolloverFlushTimer = null;
+let pendingRollover = null; // handed back by POST /api/session, injected on open
+
+// The one place that decides whether the API accepts a system-role
+// conversation item. OpenAI's own compaction cookbook uses one here, but this
+// codebase has only ever sent user-role items (see the missed-reminders block
+// in onDataChannelOpen). If the server rejects the item or the model ignores
+// it, switch this to "user" — the text is written to work either way.
+const ROLLOVER_ROLE = "system";
+
+function recordTurn(role, text) {
+  const clean = String(text || "").trim();
+  if (!clean) return;
+  // Never let a rollover open with Nova talking: the first thing she says is a
+  // greeting or a "sorry, I lost you", neither of which is worth carrying.
+  if (role === "assistant" && !turnBuffer.length) { pendingTools = []; return; }
+  turnBuffer.push({
+    role,
+    text: clean,
+    tools: role === "assistant" ? pendingTools : [],
+    mode: sessionMode,
+  });
+  if (role === "assistant") pendingTools = [];
+  if (turnBuffer.length > ROLLOVER_TURNS) turnBuffer = turnBuffer.slice(-ROLLOVER_TURNS);
+  if (!rolloverFlushTimer) {
+    rolloverFlushTimer = setTimeout(() => { rolloverFlushTimer = null; flushRollover(); }, ROLLOVER_FLUSH_MS);
+  }
+}
+
+// Fire-and-forget: a failed flush is dropped, never retried into the voice
+// path. Debouncing is what makes this survive an *unclean* drop — by the time
+// the connection dies the server already has everything but the last few
+// seconds.
+function flushRollover() {
+  if (!turnBuffer.length) return; // never overwrite a good rollover with nothing
+  fetch("/api/memory/rollover", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ turns: turnBuffer }),
+  }).catch(() => {});
+}
+
+// A reload never reaches teardown(), and an in-flight fetch() dies with the
+// page — sendBeacon is the one request the browser promises to finish.
+addEventListener("pagehide", () => {
+  if (!turnBuffer.length || !navigator.sendBeacon) return;
+  navigator.sendBeacon(
+    "/api/memory/rollover",
+    new Blob([JSON.stringify({ turns: turnBuffer })], { type: "application/json" })
+  );
+});
+
 // ---------- Server event handling ----------
 
 let currentAssistantMsg = null;
@@ -1344,9 +1486,12 @@ let currentUserMsg = null;
 function handleServerEvent(evt) {
   switch (evt.type) {
     // The user's speech transcript (input side)
-    case "conversation.item.input_audio_transcription.completed":
-      addMessage("user", evt.transcript?.trim() || "…");
+    case "conversation.item.input_audio_transcription.completed": {
+      const said = evt.transcript?.trim() || "";
+      addMessage("user", said || "…");
+      recordTurn("user", said);
       break;
+    }
 
     case "input_audio_buffer.speech_started":
       if (!assistantSpeaking) setRingState("listening", "Listening…");
@@ -1362,6 +1507,7 @@ function handleServerEvent(evt) {
       break;
 
     case "response.output_audio_transcript.done":
+      recordTurn("assistant", evt.transcript);
       currentAssistantMsg = null;
       break;
 
@@ -1372,6 +1518,7 @@ function handleServerEvent(evt) {
       break;
 
     case "response.output_text.done":
+      recordTurn("assistant", evt.text);
       currentAssistantMsg = null;
       break;
 
@@ -1408,6 +1555,7 @@ async function runTool(name, callId, argsJson) {
   let args = {};
   try { args = JSON.parse(argsJson || "{}"); } catch {}
   addMessage("event", `⚙ ${name}(${summarizeArgs(args)})`);
+  pendingTools.push(name); // provenance for the rollover filter (Plan 9)
   let output;
   try {
     const handler = toolHandlers[name];

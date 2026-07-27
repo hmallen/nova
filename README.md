@@ -39,6 +39,10 @@ Try:
 - "Add the news to my good night routine" · "What are my routines?"
 - "Remember that I live in Portland" · "Call me Sam" · "Use celsius" —
   preferences persist and are honored next session ("What do you know about me?")
+- "Remember that I'm allergic to shellfish" · "Remember my daughter is Mia" ·
+  "Forget that" — open-ended facts, shared across every device in the house
+- "What did I just ask you?" — after a dropped connection or a page reload,
+  Nova picks the conversation back up instead of starting cold
 - "Change your voice to cedar" — takes effect on the next session
 - "Tell me a joke" · "How many ounces in a cup?" — answered directly by the model
 
@@ -51,8 +55,9 @@ type a question, read the answer. Typing never opens the microphone. Submitting
 while idle starts a **text session** (no mic permission, no recording
 indicator, no spoken replies) and answers your question in place of the
 greeting; the ring glows dim to show Nova is connected but not listening. Tap
-the ring to switch to talking out loud — that starts a fresh voice session, so
-Nova won't remember the typed exchange, the same as after a reconnect.
+the ring to switch to talking out loud — that starts a fresh voice session, but
+the typed exchange carries over, the same as after a reconnect (see
+**Memory** below).
 
 Typing *during* a voice session works too: the answer comes back written
 instead of spoken, and it interrupts Nova if she's mid-sentence. Tools behave
@@ -105,6 +110,18 @@ Browser ──(mic audio via WebRTC)──────────► OpenAI Rea
   announced once at the start of the next session.
 - **Stopwatches** count upward in the same timekeeping card and survive page
   refreshes until stopped.
+- **Memory** lives server-side in `data/memory.json`, in two layers. *Facts*
+  are open-ended things Nova was explicitly asked to remember (`remember` tool)
+  and are appended to the system prompt at session mint, next to today's
+  preferences; nothing writes them automatically, contradictions supersede
+  rather than delete, and "forget that" is a soft delete. *Rollover* is the
+  last few turns of the conversation, mirrored to the server as text and
+  replayed as one framed item into the next session — which is what makes
+  "what did I just ask you?" work across a dropped connection, a page reload,
+  or the Realtime API's 60-minute session cap. Only turns from the last
+  `ROLLOVER_MAX_AGE_MIN` minutes (default 30) come back, and turns that read
+  news headlines are dropped so third-party text can't ride forward into the
+  next session's context.
 
 ## Real integrations (all optional, env-gated)
 
@@ -270,5 +287,11 @@ Sources:
   should ring on the kitchen tablet, and cross-device ringing would need push.
 - Preferences (name, home city, units, voice) are a single per-browser profile —
   multiple people sharing one browser share one set of preferences.
+- Remembered facts and conversation rollover are one shared household memory,
+  stored server-side with no auth — the same LAN trust level as lists. Ask on
+  the kitchen tablet and follow up on your phone and it carries; there is no
+  per-person scoping yet, so everyone in the house sees everyone's facts.
+  Nothing is remembered unless you ask for it, and nothing is summarized by a
+  model on the way in — facts and turns are stored as text, verbatim.
 - Realtime audio is billed per audio token; use `REALTIME_MODEL=gpt-realtime-2.1-mini`
   in `.env` for cheaper experimentation.

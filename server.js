@@ -23,6 +23,16 @@ import { parseRss } from "./lib/rss.js";
 import { parseIcs, expandEvents } from "./lib/ics.js";
 import { parseEnv, applyEnv } from "./lib/env.js";
 import { sanitizePrefs, buildAboutBlock } from "./lib/prefs.js";
+import {
+  addFact,
+  forgetFact,
+  activeFacts,
+  factsForPrompt,
+  sanitizeRollover,
+  rolloverForSession,
+  renderRolloverText,
+  DEFAULT_ROLLOVER_MAX_AGE_MIN,
+} from "./lib/memory.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -105,6 +115,12 @@ If the user tells you something to remember about themselves (their name, home
 city, temperature units, or which voice to use), call manage_preferences to
 save it — don't just acknowledge.
 
+If they ask you to remember anything else — an allergy, a family member, a
+habit — call remember to save it; don't just say you will. If they tell you
+something that contradicts a fact you were given, save the new one with the
+"replaces" field set to the old fact's id. Memory ids are for your use only:
+never say one out loud.
+
 When the user greets you with "good morning" or "good night", call run_routine
 with that name if it exists. Present routine results as one connected update,
 not a list of tool outputs: weather first, then today's schedule, then a few
@@ -164,6 +180,15 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
 
   mkdirSync(dataDir, { recursive: true });
   const store = createStore(path.join(dataDir, "state.json"));
+  // Memory gets its own file (Plan 9): separate blast radius, separate backup,
+  // and a corrupt memory file can never take the shopping list down with it.
+  const memory = createStore(path.join(dataDir, "memory.json"), { facts: [], rollover: null });
+  // How long a finished conversation stays replayable. 0 turns rollover off.
+  const ROLLOVER_MAX_AGE_MIN = (() => {
+    const raw = String(env.ROLLOVER_MAX_AGE_MIN ?? "").trim();
+    const minutes = Number(raw);
+    return raw && Number.isFinite(minutes) && minutes >= 0 ? minutes : DEFAULT_ROLLOVER_MAX_AGE_MIN;
+  })();
 
   // ---- News (Plan 4): keyless RSS proxy — browsers can't fetch
   // cross-origin RSS, so the server does, and returns speakable headlines.
@@ -274,12 +299,12 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
   // Session template. Tool definitions live in the client (public/app.js)
   // alongside their implementations and are attached via session.update once
   // the data channel opens.
-  function sessionConfig(prefs = {}) {
+  function sessionConfig(prefs = {}, facts = []) {
     return {
       session: {
         type: "realtime",
         model: REALTIME_MODEL,
-        instructions: INSTRUCTIONS + buildAboutBlock(prefs),
+        instructions: INSTRUCTIONS + buildAboutBlock(prefs, facts),
         audio: {
           output: { voice: prefs.voice || VOICE },
         },
@@ -287,14 +312,14 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
     };
   }
 
-  async function mintClientSecret(prefs) {
+  async function mintClientSecret(prefs, facts) {
     const resp = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(sessionConfig(prefs)),
+      body: JSON.stringify(sessionConfig(prefs, facts)),
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -317,15 +342,87 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
           const body = await readBody(req);
           prefs = sanitizePrefs(body ? JSON.parse(body).prefs : null);
         } catch {} // absent/invalid body → default session
+        // Remembered facts (Plan 9) live server-side and are never posted from
+        // the browser — that keeps them shared across devices and removes a
+        // whole class of injection at the same time.
+        const mem = memory.get();
+        const { facts, dropped } = factsForPrompt(mem.facts);
+        if (dropped) {
+          console.warn(`  ⚠  memory: ${dropped} fact(s) left out of the prompt (over the size cap).`);
+        }
         try {
-          const secret = await mintClientSecret(prefs);
+          const secret = await mintClientSecret(prefs, facts);
+          const rollover = rolloverForSession(mem.rollover, { maxAgeMin: ROLLOVER_MAX_AGE_MIN });
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ value: secret.value, model: REALTIME_MODEL }));
+          res.end(JSON.stringify({
+            value: secret.value,
+            model: REALTIME_MODEL,
+            // Rides back on the response the client already waits for, so
+            // rehydration costs no extra round trip on the startup path.
+            rollover: rollover ? { text: renderRolloverText(rollover.turns) } : null,
+          }));
         } catch (err) {
           res.writeHead(502, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: String(err.message || err) }));
         }
         return;
+      }
+
+      // ---- Memory (Plan 9). Same LAN trust level as the lists above. ----
+      if (req.url.split("?")[0] === "/api/memory/facts") {
+        // Only id and text go back to the client: tool results are read aloud,
+        // so they stay small and speakable.
+        const speakable = (f) => ({ id: f.id, text: f.text });
+        if (req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ facts: activeFacts(memory.get().facts).map(speakable) }));
+          return;
+        }
+        if (req.method === "POST") {
+          let body;
+          try { body = JSON.parse(await readBody(req)); } catch { body = null; }
+          let result = { error: "Unknown action." };
+          if (body?.action === "add" || body?.action === "forget") {
+            await memory.update((cur) => {
+              result = body.action === "add"
+                ? addFact(cur.facts, { text: body.text, replaces: body.replaces, source: "speech" })
+                : forgetFact(cur.facts, body.id);
+              if (result.error) return null; // no write, no rev bump
+              return { ...cur, facts: result.facts };
+            });
+          }
+          if (result.error) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: result.error }));
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result.fact
+            ? { ok: true, fact: speakable(result.fact) }
+            : { ok: true, forgot: speakable(result.forgotten) }));
+          return;
+        }
+        res.writeHead(405); res.end(); return;
+      }
+
+      // POST as well as PUT: the client flushes on pagehide via sendBeacon,
+      // which can only POST.
+      if (req.url.split("?")[0] === "/api/memory/rollover") {
+        if (req.method === "PUT" || req.method === "POST") {
+          let body;
+          try { body = JSON.parse(await readBody(req)); } catch { body = null; }
+          const rollover = sanitizeRollover(body);
+          if (!rollover) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Bad rollover payload" }));
+            return;
+          }
+          await memory.update((cur) => ({ ...cur, rollover }));
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        res.writeHead(405); res.end(); return;
       }
 
       // Which optional integrations are live (non-secret config only).
@@ -460,7 +557,7 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
           let conflict = false;
           const next = await store.update((cur) => {
             if (body.rev !== cur.rev) { conflict = true; return null; }
-            return body.lists;
+            return { ...cur, lists: body.lists };
           });
           if (conflict) {
             // Stale client: hand back current state so it can re-apply on top.
