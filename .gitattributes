@@ -1,0 +1,8 @@
+# The dev box is Windows and the wake-word service runs on a Raspberry Pi.
+# A shell script or a systemd unit checked out with CRLF fails on Linux with
+# "bad interpreter: /usr/bin/env bash^M", so pin the line endings that have to
+# survive the trip rather than leaving it to each machine's core.autocrlf.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.service text eol=lf

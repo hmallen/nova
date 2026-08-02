@@ -187,14 +187,25 @@ async function geocodeCity(location) {
 // ---------- Integration config (Plan 7) ----------
 // Fetched once at boot, before any session starts: the model should only be
 // told about devices/calendar/radio that actually exist.
-let appConfig = { homeAssistant: false, calendar: false, calendarWritable: false, googleConfigured: false, radio: [] };
+let appConfig = { homeAssistant: false, calendar: false, calendarWritable: false, googleConfigured: false, radio: [], wakeService: false };
 // event_ref → Google event id, re-seeded on every get_calendar. Writes are
 // addressed by ref so the model never has to repeat an opaque id back.
 let calendarRefs = new Map();
 const configReady = fetch("/api/config")
   .then(r => (r.ok ? r.json() : appConfig))
   .then(c => {
-    appConfig = { homeAssistant: false, calendar: false, calendarWritable: false, googleConfigured: false, radio: [], ...c };
+    appConfig = { homeAssistant: false, calendar: false, calendarWritable: false, googleConfigured: false, radio: [], wakeService: false, ...c };
+    // Which wake-word backend this device gets. The local service wins when
+    // it's running: the browser's recognizer can't be pointed at a microphone
+    // and doesn't work at all on the Pi's Chromium. This resolves *after* the
+    // remembered setting has already armed the browser one, so hand over
+    // rather than letting both hold a microphone.
+    if (appConfig.wakeService) {
+      stopWakeListening();
+      wakeNotice = "";
+      connectWakeStream();
+    }
+    setWakeUi();
     if (appConfig.homeAssistant) initHaDevices();
     initCalendarCard();
     if (appConfig.calendar) {
@@ -1348,6 +1359,7 @@ async function startSession() {
   // Before anything touches the microphone: the wake-word recognizer holds it
   // too, and getUserMedia has to find it free.
   stopWakeListening();
+  reportSessionState(true); // close the wake gate before Nova can hear herself
   setRingState("connecting", wasReconnect ? "Reconnecting…" : "Connecting…");
   try {
     // 1. Ephemeral client secret from our server (real API key never reaches
@@ -1612,6 +1624,7 @@ function teardown() {
   connected = false;
   assistantSpeaking = false;
   clearIdleTimeout();
+  reportSessionState(false);
   // Get the tail on the server now — the next session may be seconds away.
   if (rolloverFlushTimer) { clearTimeout(rolloverFlushTimer); rolloverFlushTimer = null; }
   if (archiveFlushTimer) { clearTimeout(archiveFlushTimer); archiveFlushTimer = null; }
@@ -2207,9 +2220,49 @@ function sessionLive() {
   return connected || Boolean(pc) || Boolean(reconnectTimer);
 }
 
+// ---------- Wake word, backend 1: the local service ----------
+// wakeword/nova_wake.py owns the microphone and does the spotting offline;
+// this end just listens for the verdict. EventSource reconnects by itself, so
+// a server restart heals without help.
+
+let wakeStream = null;
+
+function connectWakeStream() {
+  if (wakeStream) return;
+  wakeStream = new EventSource("/api/events");
+  wakeStream.addEventListener("wake", (e) => {
+    let heard = "";
+    try { heard = JSON.parse(e.data || "{}").heard || ""; } catch {}
+    wakeLog("service woke us", heard ? JSON.stringify(heard) : "");
+    // Armed per device on purpose: the stream reaches every browser with Nova
+    // open, and a wake in the kitchen must not open a microphone on a phone
+    // in someone's pocket.
+    if (!wakeEnabled || sessionLive()) return;
+    userStartSession("voice");
+  });
+  wakeStream.onerror = () => wakeLog("wake stream dropped — EventSource will retry");
+}
+
+// The service can't know whether Nova is already listening, so the server
+// gates on this and drops wakes while a session is live. Fire-and-forget: a
+// missed report costs a duplicate wake, never the conversation.
+function reportSessionState(active) {
+  if (!appConfig.wakeService) return;
+  fetch("/api/wake/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active }),
+  }).catch(() => {});
+}
+
 function startWakeListening() {
   setWakeUi();
-  if (!wakeEnabled || !SpeechRec || insecureContext) return;
+  if (!wakeEnabled) return;
+  // Backend 1 is already listening on its own microphone — there is nothing
+  // for the browser recognizer to do, and two things holding the mic is how
+  // this went wrong in the first place.
+  if (appConfig.wakeService) return;
+  if (!SpeechRec || insecureContext) return;
   if (sessionLive() || wakeRec || wakeRestartTimer) return;
 
   let rec;
@@ -2317,7 +2370,9 @@ function stopWakeListening() {
 }
 
 function setWakeEnabled(on) {
-  if (on && (!SpeechRec || insecureContext)) {
+  // Only the browser backend has these requirements; the service has its own
+  // microphone and doesn't care what this browser can or can't do.
+  if (on && !appConfig.wakeService && (!SpeechRec || insecureContext)) {
     wakeEnabled = false;
     wakeNotice = SpeechRec
       ? "Wake word needs HTTPS — see README"

@@ -56,11 +56,13 @@ Try:
 - "Change your voice to cedar" — takes effect on the next session
 - "Tell me a joke" · "How many ounces in a cup?" — answered directly by the model
 
-Optionally click **Enable wake word** to say "Nova" hands-free to start a
-session (uses the browser's on-device speech recognition purely as a trigger;
-everything after the wake word is OpenAI). The setting is remembered, and a
-session that goes quiet closes itself and hands the microphone back to the
-wake word — see **Hands-free** below.
+Click **Enable wake word** to say "Nova" hands-free to start a session — the
+detection is local and only the session that follows is OpenAI. On a Raspberry
+Pi (or for reliable spotting anywhere) install the offline service first with
+`cd wakeword && ./setup.sh`; without it the browser's own recognizer is used,
+which is a fallback and does not work on the Pi at all. The setting is
+remembered, and a session that goes quiet closes itself and hands the
+microphone back — see **Hands-free** below.
 
 You can also **type to Nova** — the box under the transcript answers in kind:
 type a question, read the answer. Typing never opens the microphone. Submitting
@@ -284,7 +286,29 @@ DevTools → Application → Service workers.
 
 A wall tablet has no way to tap the ring, so the two halves of hands-free
 operation are the wake word and the idle timeout — one gets a session started,
-the other gets it ended:
+the other gets it ended.
+
+**On a Raspberry Pi, install the wake-word service** — the browser cannot do
+this job there:
+
+```bash
+cd wakeword && ./setup.sh
+```
+
+Chromium on the Pi has no speech backend, so the Web Speech API the browser
+fallback relies on attaches to the microphone, streams, and reports
+`no-speech` forever. The service ([wakeword/](wakeword/README.md)) does the
+spotting locally with [Vosk](https://alphacephei.com/vosk/) — offline, no
+account, no API key, no audio leaving the machine — and tells the browser over
+an event stream. Nova picks it up automatically: `/api/config` reports the
+service, and the browser stops using its own recognizer the moment one checks
+in. `wakeword/nova-wake.service` runs it at boot.
+
+The wake endpoints are loopback-only. Lists and memory are LAN-readable by
+design, but "open the microphone" is a different kind of verb, so only the
+machine Nova runs on can fire one.
+
+Both backends share the rest:
 
 - **Enable wake word** once, on the device, and allow the microphone when the
   browser asks. The setting is remembered per browser, so a refresh, a power
@@ -308,17 +332,17 @@ sitting there lit: browsers without the Web Speech API (Safari, Firefox) and
 pages served over plain `http://` both say so, and a denied microphone turns
 the setting back off instead of retrying forever.
 
-**If the wake word hears nothing but the session transcribes you fine**, the
-two are listening to different microphones. Speech recognition always uses the
-*system default* input device and has no API to choose another, while the
+**If the browser fallback hears nothing but the session transcribes you fine**,
+the two are listening to different microphones. The Web Speech API always uses
+the *system default* input device and has no API to choose another, while the
 session uses `getUserMedia`, which Chrome lets you point at a specific
 microphone per site (the camera/mic icon in the address bar). They disagree
 more often than you'd expect on a desktop with a webcam, a headset and a
 built-in mic. Nova detects this — after about 35 seconds of picking up no
 sound at all, the hint turns amber and says so, and clears itself the moment
-any sound arrives. The fix is to make the microphone you actually talk into
-the Windows/macOS default input device, or to point the site's mic setting at
-the default one.
+any sound arrives. Make the microphone you actually talk into the system
+default, or install the wake-word service, which takes a `--device` and has no
+such limitation.
 
 ## Testing
 
@@ -394,17 +418,19 @@ Sources:
   everything AI is OpenAI.
 - Smart-home devices are simulated by default — set `HA_URL`/`HA_TOKEN` to
   drive real Home Assistant devices (see "Real integrations").
-- The wake word uses the browser's own Web Speech API (Chrome/Edge) and only
-  *starts* a session; keeping a Realtime session always-on just to detect a
-  wake word would stream audio (and billing) continuously. Note that in Chrome
-  this is not necessarily on-device — recognition may be served by Google's
-  speech service, so treat it as a third party hearing the room, not as local
-  processing.
-- The API gives no way to hold a recognizer open indefinitely: Chrome ends
-  every run after exactly 8 seconds of silence, so Nova restarts it in a loop.
-  Chrome's own teardown and startup dominate the gap, which measures ~0.6–1 s
-  — about a tenth of the time, Nova is deaf. Say "Nova" again if the first one
-  doesn't take.
+- The wake word only ever *starts* a session; keeping a Realtime session
+  always-on just to detect a wake word would stream audio (and billing)
+  continuously. There are two backends. The local service (`wakeword/`) is the
+  one to use: fully offline, picks its own microphone, no gaps. The browser's
+  Web Speech API is a fallback for a desktop Chrome with no service installed —
+  it does not work on the Pi at all, in Chrome it may route audio through
+  Google's speech service rather than staying on-device, and since Chrome ends
+  every run after 8 seconds of silence Nova has to restart it in a loop, which
+  leaves it deaf roughly a tenth of the time.
+- The service's zero-dependency rule stops at the wake word: it needs Python,
+  `vosk` and `sounddevice`. The Node server and the browser client are still
+  dependency-free, and Nova runs fine without the service — just not
+  hands-free on a Pi.
 - The wake word matches loosely on purpose ("no va", "novah" and "Noah" all
   count), because the recognizer is tuned for phrases rather than names. A
   false trigger is cheap: it opens a session that closes itself again after a

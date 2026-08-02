@@ -3,3 +3,8 @@ data/
 node_modules/
 .claude/settings.local.json
 certs/
+# Wake-word service: a virtualenv and a ~40 MB speech model, both rebuilt by
+# wakeword/setup.sh on whatever machine is running it.
+wakeword/.venv/
+wakeword/models/
+__pycache__/
