@@ -2,10 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   formatElapsedTime,
+  matchesWakeWord,
   normalizePinnedDeviceKeys,
+  readIdleTimeoutMs,
   redactArgs,
   summarizeToolResult,
   spokenPastTime,
+  DEFAULT_IDLE_TIMEOUT_MS,
 } from "../public/lib/helpers.js";
 
 test("formatElapsedTime renders stopwatch durations", () => {
@@ -77,4 +80,53 @@ test("spokenPastTime says when, the way a person would", () => {
     new RegExp(`^${july29.toLocaleDateString([], { weekday: "long" })} at `));
   assert.equal(spokenPastTime(new Date(2026, 6, 20, 9, 5).toISOString(), now).includes(" at "), false);
   assert.equal(spokenPastTime("not a date"), "at some point");
+});
+
+// ---- wake word & idle timeout ----
+
+test("matchesWakeWord accepts what the recognizer actually returns", () => {
+  // Exact, and the shapes browsers really hand back for "Nova".
+  for (const heard of [
+    "Nova",
+    "nova",
+    "hey nova, what's the weather",
+    "Nova.",                 // final results arrive punctuated
+    "no va",                 // two-word split is the most common miss
+    "Novah",
+    "noah",
+    "OK NOVA",
+  ]) {
+    assert.equal(matchesWakeWord(heard), true, `should wake on ${JSON.stringify(heard)}`);
+  }
+});
+
+test("matchesWakeWord ignores ordinary speech", () => {
+  for (const heard of ["november", "innovation", "not now", "", null, undefined, "supernova"]) {
+    assert.equal(matchesWakeWord(heard), false, `should ignore ${JSON.stringify(heard)}`);
+  }
+});
+
+test("readIdleTimeoutMs falls back rather than listening forever", () => {
+  assert.equal(readIdleTimeoutMs(null), DEFAULT_IDLE_TIMEOUT_MS);
+  assert.equal(readIdleTimeoutMs(undefined), DEFAULT_IDLE_TIMEOUT_MS);
+  assert.equal(readIdleTimeoutMs(""), DEFAULT_IDLE_TIMEOUT_MS);
+  assert.equal(readIdleTimeoutMs("  "), DEFAULT_IDLE_TIMEOUT_MS);
+  assert.equal(readIdleTimeoutMs("banana"), DEFAULT_IDLE_TIMEOUT_MS);
+  assert.equal(readIdleTimeoutMs(-5), DEFAULT_IDLE_TIMEOUT_MS);
+});
+
+test("readIdleTimeoutMs reads seconds, clamped to something sane", () => {
+  assert.equal(readIdleTimeoutMs("120"), 120_000);
+  assert.equal(readIdleTimeoutMs(90), 90_000);
+  assert.equal(readIdleTimeoutMs("45.5"), 45_500);
+  // Too short would cut off a thinking pause; too long isn't a timeout at all.
+  assert.equal(readIdleTimeoutMs("3"), 10_000);
+  assert.equal(readIdleTimeoutMs("99999"), 30 * 60_000);
+});
+
+test("readIdleTimeoutMs lets a device opt out explicitly", () => {
+  assert.equal(readIdleTimeoutMs("off"), 0);
+  assert.equal(readIdleTimeoutMs("never"), 0);
+  assert.equal(readIdleTimeoutMs("0"), 0);
+  assert.equal(readIdleTimeoutMs("OFF"), 0);
 });

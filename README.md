@@ -58,7 +58,9 @@ Try:
 
 Optionally click **Enable wake word** to say "Nova" hands-free to start a
 session (uses the browser's on-device speech recognition purely as a trigger;
-everything after the wake word is OpenAI).
+everything after the wake word is OpenAI). The setting is remembered, and a
+session that goes quiet closes itself and hands the microphone back to the
+wake word — see **Hands-free** below.
 
 You can also **type to Nova** — the box under the transcript answers in kind:
 type a question, read the answer. Typing never opens the microphone. Submitting
@@ -278,6 +280,34 @@ the static shell (network-first, so development always serves fresh files
 while the server is up); if it ever gets in your way, unregister it via
 DevTools → Application → Service workers.
 
+### Hands-free (no keyboard, no mouse)
+
+A wall tablet has no way to tap the ring, so the two halves of hands-free
+operation are the wake word and the idle timeout — one gets a session started,
+the other gets it ended:
+
+- **Enable wake word** once, on the device, and allow the microphone when the
+  browser asks. The setting is remembered per browser, so a refresh, a power
+  cut, or an overnight reboot comes back listening without anyone touching it.
+  (That first tap is also what unlocks audio playback, so leave it as the last
+  thing you do when setting a device up.)
+- **A session with nothing to do closes itself** after a minute of silence,
+  returns the ring to idle, and puts the wake word back on the microphone.
+  Without it, the first "Nova" of the day would hold an open Realtime session —
+  and its per-minute billing — until someone reloaded the page.
+
+The timeout only counts real silence: it is suspended while Nova is thinking,
+speaking, running a tool, or announcing a timer, so a long news briefing is
+never cut off mid-sentence. Change it per device with `?idle=<seconds>`
+(remembered, so `https://<lan-ip>:3000/?idle=180` only has to be loaded once),
+or `?idle=off` to disable it — on a device you can still tap, that's a
+reasonable choice.
+
+If the wake word can't run, the hint under the ring says why rather than
+sitting there lit: browsers without the Web Speech API (Safari, Firefox) and
+pages served over plain `http://` both say so, and a denied microphone turns
+the setting back off instead of retrying forever.
+
 ## Testing
 
 ```bash
@@ -354,7 +384,14 @@ Sources:
   drive real Home Assistant devices (see "Real integrations").
 - The wake word runs on-device via the Web Speech API (Chrome/Edge) and only
   *starts* a session; keeping a Realtime session always-on just to detect a
-  wake word would stream audio (and billing) continuously.
+  wake word would stream audio (and billing) continuously. The API gives no
+  way to hold a recognizer open indefinitely — it ends every run after a few
+  seconds of silence — so Nova restarts it in a loop, and there is a ~¼-second
+  deaf gap between runs. Say "Nova" again if the first one doesn't take.
+- The wake word matches loosely on purpose ("no va", "novah" and "Noah" all
+  count), because the recognizer is tuned for phrases rather than names. A
+  false trigger is cheap: it opens a session that closes itself again after a
+  minute of silence.
 - List sync has no auth — anyone on your LAN can read or edit lists (the same
   trust level as a smart speaker on your network). Timers, alarms, and
   reminders stay per-device on purpose: a timer set on the kitchen tablet

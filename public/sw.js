@@ -8,7 +8,7 @@
  * acceptable for a shell this small.
  */
 
-const CACHE = "nova-v5";
+const CACHE = "nova-v6";
 const SHELL = [
   "/",
   "/app.js",
