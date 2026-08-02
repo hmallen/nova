@@ -2172,8 +2172,19 @@ const WAKE_HINT_TEXT = "Say “Nova” to start talking";
 // supervised restart loop, and the restart has to go through a timer, because
 // start() throws InvalidStateError while the previous run is still unwinding,
 // which is exactly what calling it straight out of onend does.
-const WAKE_RESTART_MS = 250;
+const WAKE_RESTART_MS = 100;
 const WAKE_BACKOFF_MS = 3000;   // after a real error, so a wedged engine can't spin
+
+// SpeechRecognition always listens to the system default input device and has
+// no API to choose another — unlike getUserMedia, which the session uses and
+// which Chrome lets you point at a specific microphone per site. When those
+// two disagree, the session transcribes you perfectly while the wake word hears
+// silence forever, which is indistinguishable from "it's broken". After a few
+// runs that picked up no sound at all, say so.
+const WAKE_DEAF_RUNS = 4;       // ~35 s: long enough not to fire on a quiet room
+const WAKE_DEAF_NOTICE =
+  "Wake word isn't picking up any sound — check which microphone Chrome is using";
+let wakeDeafRuns = 0;
 
 let wakeEnabled = false;
 let wakeRec = null;
@@ -2181,6 +2192,14 @@ let wakeRestartTimer = null;
 let wakeBackoff = false;
 let wakeNotice = "";            // sticky explanation, shown in place of the hint
 const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+// This feature has failed silently twice. Every run of the recognizer says so
+// in the console, because the interesting failures (a run that ends and never
+// comes back, a result that arrives but doesn't match) are invisible from the
+// outside — the button says "Wake word on" either way.
+function wakeLog(...args) {
+  console.log("[wake]", ...args);
+}
 
 // A session being set up counts as live: the recognizer has to be off the
 // microphone before getUserMedia asks for it, not after the SDP round-trip.
@@ -2197,11 +2216,24 @@ function startWakeListening() {
   try { rec = new SpeechRec(); } catch { return; }
   rec.continuous = true;
   rec.interimResults = true;
-  rec.lang = navigator.language || "en-US";
+  // "Nova" is an English name, and the recognizer matches phonetically against
+  // whatever language it is set to. Follow the document, not navigator.language
+  // — a browser set to another locale would otherwise transcribe the wake word
+  // into a phonetic system it can never match.
+  rec.lang = document.documentElement.lang || "en-US";
+
+  // Any sound at all — not just speech — means the microphone is live.
+  rec.onsoundstart = () => {
+    wakeDeafRuns = 0;
+    if (wakeNotice === WAKE_DEAF_NOTICE) { wakeNotice = ""; setWakeUi(); }
+  };
 
   rec.onresult = (e) => {
     for (let i = e.resultIndex; i < e.results.length; i++) {
-      if (!matchesWakeWord(e.results[i][0].transcript)) continue;
+      const heard = e.results[i][0].transcript;
+      const hit = matchesWakeWord(heard);
+      wakeLog(`heard ${JSON.stringify(heard)}${hit ? " → WAKE" : ""}`);
+      if (!hit) continue;
       stopWakeListening();
       userStartSession("voice");
       return;
@@ -2211,14 +2243,17 @@ function startWakeListening() {
   // Every run ends here, including the ones the engine ended by itself.
   // Restarting is what makes the wake word continuous.
   rec.onend = () => {
-    if (wakeRec !== rec) return;  // superseded by stopWakeListening()
+    if (wakeRec !== rec) { wakeLog("run ended (superseded)"); return; }
     wakeRec = null;
-    scheduleWakeRestart(wakeBackoff ? WAKE_BACKOFF_MS : WAKE_RESTART_MS);
+    const delay = wakeBackoff ? WAKE_BACKOFF_MS : WAKE_RESTART_MS;
+    wakeLog(`run ended, restarting in ${delay}ms`);
+    scheduleWakeRestart(delay);
     wakeBackoff = false;
   };
 
   rec.onerror = (e) => {
     const err = e?.error;
+    wakeLog("error:", err);
     // Permission is not something a retry fixes. Retrying it forever is how
     // the button ends up saying "Wake word on" over a recognizer that will
     // never hear anything.
@@ -2230,15 +2265,28 @@ function startWakeListening() {
     }
     // "no-speech" is just how a quiet room ends a run — restart at full speed.
     // Anything else (network, audio-capture) gets the slower retry.
-    if (err && err !== "no-speech" && err !== "aborted") wakeBackoff = true;
+    if (err === "no-speech") {
+      // ...but a room is not quiet for 35 seconds with a microphone in it.
+      // Keep listening — this is a hint, not a verdict, and it clears itself
+      // the moment any sound arrives.
+      if (++wakeDeafRuns >= WAKE_DEAF_RUNS && !wakeNotice) {
+        wakeLog("no sound across", wakeDeafRuns, "runs — likely the wrong microphone");
+        wakeNotice = WAKE_DEAF_NOTICE;
+        setWakeUi();
+      }
+      return;
+    }
+    if (err && err !== "aborted") wakeBackoff = true;
   };
 
   wakeRec = rec;
   try {
     rec.start();
-  } catch {
+    wakeLog("run started");
+  } catch (err) {
     // Still unwinding the last run. Let the timer try again rather than going
     // silently deaf with the button still lit.
+    wakeLog("start() threw, retrying:", err?.name || err);
     wakeRec = null;
     scheduleWakeRestart(WAKE_BACKOFF_MS);
   }
@@ -2255,6 +2303,7 @@ function scheduleWakeRestart(delay) {
 function stopWakeListening() {
   if (wakeRestartTimer) { clearTimeout(wakeRestartTimer); wakeRestartTimer = null; }
   wakeBackoff = false;
+  wakeDeafRuns = 0;
   const rec = wakeRec;
   wakeRec = null;
   if (rec) {

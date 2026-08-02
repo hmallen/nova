@@ -308,6 +308,18 @@ sitting there lit: browsers without the Web Speech API (Safari, Firefox) and
 pages served over plain `http://` both say so, and a denied microphone turns
 the setting back off instead of retrying forever.
 
+**If the wake word hears nothing but the session transcribes you fine**, the
+two are listening to different microphones. Speech recognition always uses the
+*system default* input device and has no API to choose another, while the
+session uses `getUserMedia`, which Chrome lets you point at a specific
+microphone per site (the camera/mic icon in the address bar). They disagree
+more often than you'd expect on a desktop with a webcam, a headset and a
+built-in mic. Nova detects this — after about 35 seconds of picking up no
+sound at all, the hint turns amber and says so, and clears itself the moment
+any sound arrives. The fix is to make the microphone you actually talk into
+the Windows/macOS default input device, or to point the site's mic setting at
+the default one.
+
 ## Testing
 
 ```bash
@@ -382,12 +394,17 @@ Sources:
   everything AI is OpenAI.
 - Smart-home devices are simulated by default — set `HA_URL`/`HA_TOKEN` to
   drive real Home Assistant devices (see "Real integrations").
-- The wake word runs on-device via the Web Speech API (Chrome/Edge) and only
+- The wake word uses the browser's own Web Speech API (Chrome/Edge) and only
   *starts* a session; keeping a Realtime session always-on just to detect a
-  wake word would stream audio (and billing) continuously. The API gives no
-  way to hold a recognizer open indefinitely — it ends every run after a few
-  seconds of silence — so Nova restarts it in a loop, and there is a ~¼-second
-  deaf gap between runs. Say "Nova" again if the first one doesn't take.
+  wake word would stream audio (and billing) continuously. Note that in Chrome
+  this is not necessarily on-device — recognition may be served by Google's
+  speech service, so treat it as a third party hearing the room, not as local
+  processing.
+- The API gives no way to hold a recognizer open indefinitely: Chrome ends
+  every run after exactly 8 seconds of silence, so Nova restarts it in a loop.
+  Chrome's own teardown and startup dominate the gap, which measures ~0.6–1 s
+  — about a tenth of the time, Nova is deaf. Say "Nova" again if the first one
+  doesn't take.
 - The wake word matches loosely on purpose ("no va", "novah" and "Noah" all
   count), because the recognizer is tuned for phrases rather than names. A
   false trigger is cheap: it opens a session that closes itself again after a
