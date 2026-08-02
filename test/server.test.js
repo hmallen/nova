@@ -100,6 +100,82 @@ test("server smoke", async (t) => {
     }
   });
 
+  await t.test("memory facts: add, list, supersede, forget, and validation", async () => {
+    const post = (body) => fetch(base + "/api/memory/facts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    let resp = await fetch(base + "/api/memory/facts");
+    assert.deepEqual(await resp.json(), { facts: [] });
+
+    resp = await post({ action: "add", text: "Allergic to shellfish" });
+    assert.equal(resp.status, 200);
+    const shellfish = (await resp.json()).fact;
+    // Only speakable fields come back — no timestamps, no provenance.
+    assert.deepEqual(Object.keys(shellfish).sort(), ["id", "text"]);
+
+    const portland = (await (await post({ action: "add", text: "Lives in Portland" })).json()).fact;
+    resp = await post({ action: "add", text: "Lives in Seattle", replaces: portland.id });
+    assert.equal(resp.status, 200);
+
+    resp = await fetch(base + "/api/memory/facts");
+    assert.deepEqual((await resp.json()).facts.map(f => f.text),
+      ["Allergic to shellfish", "Lives in Seattle"]);
+
+    resp = await post({ action: "forget", id: shellfish.id });
+    assert.equal(resp.status, 200);
+    assert.equal((await resp.json()).forgot.text, "Allergic to shellfish");
+
+    resp = await fetch(base + "/api/memory/facts");
+    assert.deepEqual((await resp.json()).facts.map(f => f.text), ["Lives in Seattle"]);
+
+    for (const body of [
+      { action: "add", text: "   " },
+      { action: "add", text: "x", replaces: "f_nope" },
+      { action: "forget", id: "f_nope" },
+      { action: "wipe_everything" },
+      null,
+    ]) {
+      assert.equal((await post(body)).status, 400, JSON.stringify(body));
+    }
+    assert.equal((await fetch(base + "/api/memory/facts", { method: "DELETE" })).status, 405);
+  });
+
+  await t.test("memory rollover: accepts PUT and POST, rejects junk", async () => {
+    const send = (method, body) => fetch(base + "/api/memory/rollover", {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const turns = [{ role: "user", text: "what did I just ask you?", tools: [], mode: "voice" }];
+
+    assert.equal((await send("PUT", { turns })).status, 200);
+    // sendBeacon on pagehide can only POST.
+    assert.equal((await send("POST", { turns })).status, 200);
+
+    for (const body of [{ turns: [] }, { turns: "nope" }, null]) {
+      assert.equal((await send("PUT", body)).status, 400, JSON.stringify(body));
+    }
+    assert.equal((await fetch(base + "/api/memory/rollover")).status, 405);
+  });
+
+  await t.test("memory survives a corrupt file without taking the lists with it", async () => {
+    const dir = tmpDataDir();
+    fs.writeFileSync(path.join(dir, "memory.json"), "{ not json");
+    fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify({ lists: { shopping: ["milk"] }, rev: 3 }));
+    const server2 = createNovaServer({ env: { OPENAI_API_KEY: "sk-test" }, dataDir: dir });
+    const base2 = await listen(server2);
+    try {
+      assert.deepEqual(await (await fetch(base2 + "/api/memory/facts")).json(), { facts: [] });
+      assert.deepEqual(await (await fetch(base2 + "/api/lists")).json(), { lists: { shopping: ["milk"] }, rev: 3 });
+      assert.ok(fs.existsSync(path.join(dir, "memory.json.bad")));
+    } finally {
+      server2.close();
+    }
+  });
+
   await t.test("integrations report off and 404 when unconfigured", async () => {
     const resp = await fetch(base + "/api/config");
     const config = await resp.json();
