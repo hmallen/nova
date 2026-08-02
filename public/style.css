@@ -171,6 +171,9 @@ h2 {
 .pill.active { border-color: var(--cyan); color: var(--cyan); }
 
 .wake-hint { color: var(--cyan); font-size: 13px; }
+/* Same line, but explaining why the wake word isn't listening — amber is the
+   UI's "degraded" colour (see .offline-badge), not an invitation to speak. */
+.wake-hint.notice { color: var(--amber); }
 
 /* ---- Cards ---- */
 

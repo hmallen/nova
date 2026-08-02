@@ -550,3 +550,211 @@ test("HTTPS setup errors are actionable", async (t) => {
     assert.doesNotMatch(result.stderr, /\n\s+at /);
   });
 });
+
+// ---- wake word bus ----
+// The browser can't run a usable wake word on a Pi (Chromium has no speech
+// backend), so detection moved to a local service and these endpoints are the
+// wire between it and the browser.
+
+// Opens an SSE stream and resolves with a reader over the frames as they land.
+function openEventStream(base) {
+  const { hostname, port } = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname, port, path: "/api/events", headers: { Accept: "text/event-stream" } },
+      (res) => {
+        let buffered = "";
+        const waiters = [];
+        res.setEncoding("utf8");
+        // Only `event:` frames are interesting — the stream also carries a
+        // `retry:` preamble and `:` heartbeat comments.
+        const interesting = (frame) => frame.includes("event:");
+        res.on("data", (chunk) => {
+          buffered += chunk;
+          while (waiters.length && buffered.includes("\n\n")) {
+            const at = buffered.indexOf("\n\n");
+            const frame = buffered.slice(0, at);
+            buffered = buffered.slice(at + 2);
+            if (!interesting(frame)) continue;
+            waiters.shift()(frame);
+          }
+        });
+        resolve({
+          status: res.statusCode,
+          contentType: res.headers["content-type"],
+          // Frames already buffered win; otherwise wait for the next one.
+          next: () => new Promise((res2, rej2) => {
+            const timer = setTimeout(() => rej2(new Error("no SSE frame in 2s")), 2000);
+            const deliver = (frame) => { clearTimeout(timer); res2(frame); };
+            let at;
+            while ((at = buffered.indexOf("\n\n")) !== -1) {
+              const frame = buffered.slice(0, at);
+              buffered = buffered.slice(at + 2);
+              if (interesting(frame)) return deliver(frame);
+            }
+            waiters.push(deliver);
+          }),
+          close: () => req.destroy(),
+        });
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+const postJson = (base, path, body) =>
+  fetch(base + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+test("wake word bus", async (t) => {
+  const server = createNovaServer({ env: { OPENAI_API_KEY: "sk-test" }, dataDir: tmpDataDir() });
+  const base = await listen(server);
+  t.after(() => server.close());
+
+  await t.test("config reports no service until one checks in", async () => {
+    const config = await fetch(base + "/api/config").then(r => r.json());
+    assert.equal(config.wakeService, false);
+  });
+
+  await t.test("a ping marks the service live", async () => {
+    const resp = await postJson(base, "/api/wake", { event: "ping" });
+    assert.equal(resp.status, 200);
+    assert.equal((await resp.json()).ok, true);
+    const config = await fetch(base + "/api/config").then(r => r.json());
+    assert.equal(config.wakeService, true);
+  });
+
+  await t.test("a wake reaches an open browser stream", async () => {
+    const stream = await openEventStream(base);
+    assert.equal(stream.status, 200);
+    assert.match(stream.contentType, /text\/event-stream/);
+    assert.match(await stream.next(), /event: hello/);
+
+    const resp = await postJson(base, "/api/wake", { event: "wake", heard: "hey nova" });
+    assert.equal((await resp.json()).listeners, 1);
+
+    const frame = await stream.next();
+    assert.match(frame, /^event: wake$/m);
+    assert.equal(JSON.parse(frame.split("data: ")[1]).heard, "hey nova");
+
+    // Close here, not in t.after: later subtests count listeners.
+    stream.close();
+    await new Promise(r => setTimeout(r, 50)); // let the server see the drop
+  });
+
+  await t.test("a wake is dropped while a session is live, and again just after", async () => {
+    await postJson(base, "/api/wake/session", { active: true });
+    const during = await postJson(base, "/api/wake", { event: "wake" }).then(r => r.json());
+    assert.equal(during.ignored, "session-active");
+    assert.equal(during.listeners, 0);
+
+    // Nova's goodbye is still in the air right after a session ends.
+    await postJson(base, "/api/wake/session", { active: false });
+    const justAfter = await postJson(base, "/api/wake", { event: "wake" }).then(r => r.json());
+    assert.equal(justAfter.ignored, "session-active");
+  });
+
+  await t.test("wakes flow again once the cooldown passes", async () => {
+    await new Promise(r => setTimeout(r, 1600));
+    const resp = await postJson(base, "/api/wake", { event: "wake" }).then(r => r.json());
+    assert.equal(resp.ignored, undefined);
+  });
+
+  await t.test("a wake with nobody listening is reported, not an error", async () => {
+    const resp = await postJson(base, "/api/wake", { event: "wake" });
+    assert.equal(resp.status, 200);
+    assert.equal((await resp.json()).listeners, 0);
+  });
+});
+
+test("wake endpoints are loopback-only", async (t) => {
+  // "Open the microphone" is a different kind of verb from the LAN-readable
+  // lists — anything on the network must not be able to start a session.
+  const external = Object.values(os.networkInterfaces())
+    .flat()
+    .find(a => a && a.family === "IPv4" && !a.internal);
+  if (!external) {
+    t.diagnostic("no external IPv4 interface; skipping");
+    return;
+  }
+
+  const server = createNovaServer({ env: { OPENAI_API_KEY: "sk-test" }, dataDir: tmpDataDir() });
+  // Bound to every interface on purpose: reaching it over a non-loopback
+  // address is the whole point, and 127.0.0.1 would make the test vacuous.
+  const port = await new Promise((resolve) =>
+    server.listen(0, "0.0.0.0", () => resolve(server.address().port))
+  );
+  t.after(() => server.close());
+
+  for (const path of ["/api/wake", "/api/wake/session"]) {
+    const remote = await postJson(`http://${external.address}:${port}`, path,
+      { event: "wake", active: true });
+    assert.equal(remote.status, 403, `${path} should refuse a non-loopback caller`);
+    // ...and the same call over loopback still works, so the guard is about
+    // where it came from and not a blanket rejection.
+    const local = await postJson(`http://127.0.0.1:${port}`, path,
+      { event: "ping", active: false });
+    assert.equal(local.status, 200, `${path} should accept a loopback caller`);
+  }
+});
+
+// A wake has to claim the microphone straight away. The service polls
+// /api/wake/state to decide when to close its audio stream, and on a Pi that
+// stream holds the raw ALSA device, which locks the whole sound card — so
+// waiting for the browser to confirm the session would leave getUserMedia
+// fighting a busy device, and Nova with no speakers either.
+// Its own server: the claim lasts 15 s, which would leak into other subtests.
+test("a wake claims the microphone for the browser", async (t) => {
+  const server = createNovaServer({ env: { OPENAI_API_KEY: "sk-test" }, dataDir: tmpDataDir() });
+  const base = await listen(server);
+  t.after(() => server.close());
+
+  assert.equal((await fetch(base + "/api/wake/state").then(r => r.json())).active, false);
+
+  const stream = await openEventStream(base);
+  await stream.next(); // hello
+  await postJson(base, "/api/wake", { event: "wake" });
+
+  const claimed = await fetch(base + "/api/wake/state").then(r => r.json());
+  assert.equal(claimed.active, true, "a wake should claim the microphone");
+  assert.equal(claimed.listeners, 1);
+
+  // A session that never materialises must not strand the claim.
+  await postJson(base, "/api/wake/session", { active: false });
+  await new Promise(r => setTimeout(r, 1600)); // past the cooldown
+  assert.equal((await fetch(base + "/api/wake/state").then(r => r.json())).active, false,
+    "the claim must clear once Nova is done");
+
+  stream.close();
+});
+
+test("a wake with nobody listening leaves the microphone alone", async (t) => {
+  // Nothing to hand it to, so the service should just keep listening.
+  const server = createNovaServer({ env: { OPENAI_API_KEY: "sk-test" }, dataDir: tmpDataDir() });
+  const base = await listen(server);
+  t.after(() => server.close());
+
+  const resp = await postJson(base, "/api/wake", { event: "wake" }).then(r => r.json());
+  assert.equal(resp.listeners, 0);
+  assert.equal((await fetch(base + "/api/wake/state").then(r => r.json())).active, false);
+});
+
+test("wake state is loopback-only too", async (t) => {
+  const external = Object.values(os.networkInterfaces())
+    .flat()
+    .find(a => a && a.family === "IPv4" && !a.internal);
+  if (!external) { t.diagnostic("no external IPv4 interface; skipping"); return; }
+
+  const server = createNovaServer({ env: { OPENAI_API_KEY: "sk-test" }, dataDir: tmpDataDir() });
+  const port = await new Promise((resolve) =>
+    server.listen(0, "0.0.0.0", () => resolve(server.address().port))
+  );
+  t.after(() => server.close());
+
+  assert.equal((await fetch(`http://${external.address}:${port}/api/wake/state`)).status, 403);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/api/wake/state`)).status, 200);
+});

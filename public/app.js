@@ -14,7 +14,9 @@ import {
   describeWeatherCode,
   formatDays,
   formatElapsedTime,
+  matchesWakeWord,
   normalizePinnedDeviceKeys,
+  readIdleTimeoutMs,
   routineStepNames,
   redactArgs,
   summarizeToolResult,
@@ -62,6 +64,29 @@ let userStopped = false;      // set only by intentional stops — never auto-re
 let wasReconnect = false;     // the next startSession() is an automatic retry
 let reconnectTimer = null;
 let pendingTypedMessage = null; // typed while disconnected → sent once the channel opens
+
+// Idle timeout. A Realtime session holds the microphone open and bills for the
+// privilege, so silence has to end it: the wake word is the only way back in on
+// a device with no keyboard or mouse, and it can't listen while a session is
+// live. Overridable per device — `?idle=120`, or nova.idleTimeoutSec in
+// localStorage for a kiosk that can't be given a query string.
+const IDLE_TIMEOUT_MS = readIdleTimeoutMs(readIdleTimeoutSetting());
+let idleTimer = null;
+
+function readIdleTimeoutSetting() {
+  try {
+    const fromQuery = new URLSearchParams(location.search).get("idle");
+    if (fromQuery === null) return localStorage.getItem("nova.idleTimeoutSec");
+    // Normalize before it sticks: a mistyped ?idle= should not persist as a
+    // setting that quietly means "default" on every load from then on.
+    const ms = readIdleTimeoutMs(fromQuery);
+    const normalized = ms ? String(ms / 1000) : "off";
+    localStorage.setItem("nova.idleTimeoutSec", normalized);
+    return normalized;
+  } catch {
+    return null;
+  }
+}
 
 // ---------- Assistant state (the "skills") ----------
 const DEFAULT_PREFS = {
@@ -162,14 +187,25 @@ async function geocodeCity(location) {
 // ---------- Integration config (Plan 7) ----------
 // Fetched once at boot, before any session starts: the model should only be
 // told about devices/calendar/radio that actually exist.
-let appConfig = { homeAssistant: false, calendar: false, calendarWritable: false, googleConfigured: false, radio: [] };
+let appConfig = { homeAssistant: false, calendar: false, calendarWritable: false, googleConfigured: false, radio: [], wakeService: false };
 // event_ref → Google event id, re-seeded on every get_calendar. Writes are
 // addressed by ref so the model never has to repeat an opaque id back.
 let calendarRefs = new Map();
 const configReady = fetch("/api/config")
   .then(r => (r.ok ? r.json() : appConfig))
   .then(c => {
-    appConfig = { homeAssistant: false, calendar: false, calendarWritable: false, googleConfigured: false, radio: [], ...c };
+    appConfig = { homeAssistant: false, calendar: false, calendarWritable: false, googleConfigured: false, radio: [], wakeService: false, ...c };
+    // Which wake-word backend this device gets. The local service wins when
+    // it's running: the browser's recognizer can't be pointed at a microphone
+    // and doesn't work at all on the Pi's Chromium. This resolves *after* the
+    // remembered setting has already armed the browser one, so hand over
+    // rather than letting both hold a microphone.
+    if (appConfig.wakeService) {
+      stopWakeListening();
+      wakeNotice = "";
+      connectWakeStream();
+    }
+    setWakeUi();
     if (appConfig.homeAssistant) initHaDevices();
     initCalendarCard();
     if (appConfig.calendar) {
@@ -1319,7 +1355,32 @@ async function fetchSessionToken() {
   return resp;
 }
 
+// The wake-word service owns the microphone until it sees that Nova wants it,
+// which it learns by polling — so for a moment after a wake, the device can
+// still be busy. Wait it out rather than reporting a blocked microphone at the
+// exact moment the user has just spoken to us.
+async function openMicrophone(attempts = 6, waitMs = 250) {
+  const constraints = {
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  };
+  for (let i = 0; ; i++) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (err) {
+      // Busy is worth retrying; denied never fixes itself on a timer.
+      const busy = err?.name === "NotReadableError" || err?.name === "AbortError";
+      if (!busy || i >= attempts - 1) throw err;
+      setRingState("connecting", "Waiting for the microphone…");
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+}
+
 async function startSession() {
+  // Before anything touches the microphone: the wake-word recognizer holds it
+  // too, and getUserMedia has to find it free.
+  stopWakeListening();
+  reportSessionState(true); // close the wake gate before Nova can hear herself
   setRingState("connecting", wasReconnect ? "Reconnecting…" : "Connecting…");
   try {
     // 1. Ephemeral client secret from our server (real API key never reaches
@@ -1342,9 +1403,7 @@ async function startSession() {
     if (sessionMode === "text") {
       pc.addTransceiver("audio", { direction: "recvonly" });
     } else {
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
+      micStream = await openMicrophone();
       pc.addTrack(micStream.getTracks()[0], micStream);
     }
 
@@ -1387,7 +1446,6 @@ async function startSession() {
     connected = true;
     assistantAudio.volume = state.volume / 10;
     muteBtn.hidden = sessionMode !== "voice"; // nothing to mute without a mic
-    stopWakeListening(); // wake word not needed while session is live
   } catch (err) {
     console.error(err);
     teardown();
@@ -1549,6 +1607,7 @@ function createResponse({ textOnly = sessionMode === "text", instructions } = {}
 }
 
 function sendTypedMessage(text) {
+  clearIdleTimeout(); // typing is input too, even in a voice session
   if (assistantSpeaking) sendEvent({ type: "response.cancel" }); // typed barge-in
   addMessage("user", text);
   recordTurn("user", text); // no transcription event fires for typed input
@@ -1583,6 +1642,8 @@ textForm.addEventListener("submit", (e) => {
 function teardown() {
   connected = false;
   assistantSpeaking = false;
+  clearIdleTimeout();
+  reportSessionState(false);
   // Get the tail on the server now — the next session may be seconds away.
   if (rolloverFlushTimer) { clearTimeout(rolloverFlushTimer); rolloverFlushTimer = null; }
   if (archiveFlushTimer) { clearTimeout(archiveFlushTimer); archiveFlushTimer = null; }
@@ -1598,10 +1659,37 @@ function teardown() {
   muteBtn.textContent = "Mute mic";
 }
 
-function stopSession(message = "Tap the ring to wake Nova") {
+function stopSession(message = idlePrompt()) {
   teardown();
   setRingState("idle", message);
-  if (wakeEnabled) startWakeListening();
+  startWakeListening(); // no-op unless the wake word is armed
+}
+
+// ---------- Idle timeout ----------
+// Armed only while Nova is waiting on the user — setReadyState is the one place
+// that means exactly that. A long answer, a routine, or a tool call in flight is
+// not idleness, and cutting one off mid-sentence would be worse than staying
+// open a few seconds longer, so every busy transition clears the timer and the
+// return to ready re-arms it from zero.
+
+function armIdleTimeout() {
+  clearIdleTimeout();
+  if (!IDLE_TIMEOUT_MS || !connected) return;
+  idleTimer = setTimeout(onIdleTimeout, IDLE_TIMEOUT_MS);
+}
+
+function clearIdleTimeout() {
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+}
+
+function onIdleTimeout() {
+  idleTimer = null;
+  if (!connected) return;
+  // Deliberate, like a ring tap: no auto-reconnect, and stopSession puts the
+  // wake word back up on the way out.
+  userStopped = true;
+  addMessage("event", "⏹ Closed the session after a quiet stretch");
+  stopSession();
 }
 
 // ---------- Memory archive (Plan 10, Tier C) ----------
@@ -1755,10 +1843,12 @@ function handleServerEvent(evt) {
     }
 
     case "input_audio_buffer.speech_started":
+      clearIdleTimeout(); // someone is talking — that's the whole point
       if (!assistantSpeaking) setRingState("listening", "Listening…");
       break;
 
     case "input_audio_buffer.speech_stopped":
+      clearIdleTimeout();
       setRingState("thinking", "Thinking…");
       break;
 
@@ -1785,6 +1875,7 @@ function handleServerEvent(evt) {
 
     case "output_audio_buffer.started":
       assistantSpeaking = true;
+      clearIdleTimeout(); // a long answer is not a quiet room
       applyDucking();
       setRingState("speaking", "Speaking…");
       break;
@@ -1797,6 +1888,7 @@ function handleServerEvent(evt) {
       break;
 
     case "response.function_call_arguments.done":
+      clearIdleTimeout(); // a slow tool must not read as silence
       runTool(evt.name, evt.call_id, evt.arguments);
       break;
 
@@ -1889,6 +1981,7 @@ function onTimerFired(t) {
   playChime();
   // Tell Nova so it can announce it by voice, like Alexa does.
   if (connected) {
+    clearIdleTimeout(); // an alarm going off is not a quiet room either
     const text = t.kind === "reminder"
       ? `[system event] The reminder "${t.text}" is due. Say: "This is your reminder to ${t.text}."`
       : `[system event] The ${t.kind} "${t.label}" just went off. Announce it briefly.`;
@@ -2102,50 +2195,245 @@ radioAudio.addEventListener("error", () => {
 // trigger the OpenAI session hands-free while idle.
 // =====================================================================
 
+const WAKE_ENABLED_KEY = "nova.wakeWord";
+const WAKE_HINT_TEXT = "Say “Nova” to start talking";
+
+// The recognizer is not a long-lived listener: Chrome ends every run on its own
+// — after a few seconds of silence, after a network blip, sometimes for no
+// stated reason — even with continuous = true. "Listening" is therefore a
+// supervised restart loop, and the restart has to go through a timer, because
+// start() throws InvalidStateError while the previous run is still unwinding,
+// which is exactly what calling it straight out of onend does.
+const WAKE_RESTART_MS = 100;
+const WAKE_BACKOFF_MS = 3000;   // after a real error, so a wedged engine can't spin
+
+// SpeechRecognition always listens to the system default input device and has
+// no API to choose another — unlike getUserMedia, which the session uses and
+// which Chrome lets you point at a specific microphone per site. When those
+// two disagree, the session transcribes you perfectly while the wake word hears
+// silence forever, which is indistinguishable from "it's broken". After a few
+// runs that picked up no sound at all, say so.
+const WAKE_DEAF_RUNS = 4;       // ~35 s: long enough not to fire on a quiet room
+const WAKE_DEAF_NOTICE =
+  "Wake word isn't picking up any sound — check which microphone Chrome is using";
+let wakeDeafRuns = 0;
+
 let wakeEnabled = false;
 let wakeRec = null;
+let wakeRestartTimer = null;
+let wakeBackoff = false;
+let wakeNotice = "";            // sticky explanation, shown in place of the hint
 const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
 
+// This feature has failed silently twice. Every run of the recognizer says so
+// in the console, because the interesting failures (a run that ends and never
+// comes back, a result that arrives but doesn't match) are invisible from the
+// outside — the button says "Wake word on" either way.
+function wakeLog(...args) {
+  console.log("[wake]", ...args);
+}
+
+// A session being set up counts as live: the recognizer has to be off the
+// microphone before getUserMedia asks for it, not after the SDP round-trip.
+function sessionLive() {
+  return connected || Boolean(pc) || Boolean(reconnectTimer);
+}
+
+// ---------- Wake word, backend 1: the local service ----------
+// wakeword/nova_wake.py owns the microphone and does the spotting offline;
+// this end just listens for the verdict. EventSource reconnects by itself, so
+// a server restart heals without help.
+
+let wakeStream = null;
+
+function connectWakeStream() {
+  if (wakeStream) return;
+  wakeStream = new EventSource("/api/events");
+  wakeStream.addEventListener("wake", (e) => {
+    let heard = "";
+    try { heard = JSON.parse(e.data || "{}").heard || ""; } catch {}
+    wakeLog("service woke us", heard ? JSON.stringify(heard) : "");
+    // Armed per device on purpose: the stream reaches every browser with Nova
+    // open, and a wake in the kitchen must not open a microphone on a phone
+    // in someone's pocket.
+    if (!wakeEnabled || sessionLive()) return;
+    userStartSession("voice");
+  });
+  wakeStream.onerror = () => wakeLog("wake stream dropped — EventSource will retry");
+}
+
+// The service can't know whether Nova is already listening, so the server
+// gates on this and drops wakes while a session is live. Fire-and-forget: a
+// missed report costs a duplicate wake, never the conversation.
+function reportSessionState(active) {
+  if (!appConfig.wakeService) return;
+  fetch("/api/wake/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active }),
+  }).catch(() => {});
+}
+
 function startWakeListening() {
-  if (!SpeechRec || connected || wakeRec) return;
-  wakeRec = new SpeechRec();
-  wakeRec.continuous = true;
-  wakeRec.interimResults = true;
-  wakeRec.onresult = (e) => {
+  setWakeUi();
+  if (!wakeEnabled) return;
+  // Backend 1 is already listening on its own microphone — there is nothing
+  // for the browser recognizer to do, and two things holding the mic is how
+  // this went wrong in the first place.
+  if (appConfig.wakeService) return;
+  if (!SpeechRec || insecureContext) return;
+  if (sessionLive() || wakeRec || wakeRestartTimer) return;
+
+  let rec;
+  try { rec = new SpeechRec(); } catch { return; }
+  rec.continuous = true;
+  rec.interimResults = true;
+  // "Nova" is an English name, and the recognizer matches phonetically against
+  // whatever language it is set to. Follow the document, not navigator.language
+  // — a browser set to another locale would otherwise transcribe the wake word
+  // into a phonetic system it can never match.
+  rec.lang = document.documentElement.lang || "en-US";
+
+  // Any sound at all — not just speech — means the microphone is live.
+  rec.onsoundstart = () => {
+    wakeDeafRuns = 0;
+    if (wakeNotice === WAKE_DEAF_NOTICE) { wakeNotice = ""; setWakeUi(); }
+  };
+
+  rec.onresult = (e) => {
     for (let i = e.resultIndex; i < e.results.length; i++) {
-      const text = e.results[i][0].transcript.toLowerCase();
-      if (/\bnova\b|\bnoah\b/.test(text)) {
-        stopWakeListening();
-        userStartSession("voice");
-        return;
-      }
+      const heard = e.results[i][0].transcript;
+      const hit = matchesWakeWord(heard);
+      wakeLog(`heard ${JSON.stringify(heard)}${hit ? " → WAKE" : ""}`);
+      if (!hit) continue;
+      stopWakeListening();
+      userStartSession("voice");
+      return;
     }
   };
-  wakeRec.onend = () => { wakeRec = null; if (wakeEnabled && !connected) startWakeListening(); };
-  wakeRec.onerror = () => {};
-  try { wakeRec.start(); wakeHint.hidden = false; } catch { wakeRec = null; }
+
+  // Every run ends here, including the ones the engine ended by itself.
+  // Restarting is what makes the wake word continuous.
+  rec.onend = () => {
+    if (wakeRec !== rec) { wakeLog("run ended (superseded)"); return; }
+    wakeRec = null;
+    const delay = wakeBackoff ? WAKE_BACKOFF_MS : WAKE_RESTART_MS;
+    wakeLog(`run ended, restarting in ${delay}ms`);
+    scheduleWakeRestart(delay);
+    wakeBackoff = false;
+  };
+
+  rec.onerror = (e) => {
+    const err = e?.error;
+    wakeLog("error:", err);
+    // Permission is not something a retry fixes. Retrying it forever is how
+    // the button ends up saying "Wake word on" over a recognizer that will
+    // never hear anything.
+    if (err === "not-allowed" || err === "service-not-allowed") {
+      disableWakeWord(err === "not-allowed"
+        ? "Wake word needs microphone access — allow it, then turn it back on"
+        : "The browser blocked speech recognition here");
+      return;
+    }
+    // "no-speech" is just how a quiet room ends a run — restart at full speed.
+    // Anything else (network, audio-capture) gets the slower retry.
+    if (err === "no-speech") {
+      // ...but a room is not quiet for 35 seconds with a microphone in it.
+      // Keep listening — this is a hint, not a verdict, and it clears itself
+      // the moment any sound arrives.
+      if (++wakeDeafRuns >= WAKE_DEAF_RUNS && !wakeNotice) {
+        wakeLog("no sound across", wakeDeafRuns, "runs — likely the wrong microphone");
+        wakeNotice = WAKE_DEAF_NOTICE;
+        setWakeUi();
+      }
+      return;
+    }
+    if (err && err !== "aborted") wakeBackoff = true;
+  };
+
+  wakeRec = rec;
+  try {
+    rec.start();
+    wakeLog("run started");
+  } catch (err) {
+    // Still unwinding the last run. Let the timer try again rather than going
+    // silently deaf with the button still lit.
+    wakeLog("start() threw, retrying:", err?.name || err);
+    wakeRec = null;
+    scheduleWakeRestart(WAKE_BACKOFF_MS);
+  }
+}
+
+function scheduleWakeRestart(delay) {
+  if (wakeRestartTimer || !wakeEnabled) return;
+  wakeRestartTimer = setTimeout(() => {
+    wakeRestartTimer = null;
+    startWakeListening();
+  }, delay);
 }
 
 function stopWakeListening() {
-  wakeHint.hidden = true;
-  if (wakeRec) {
-    const r = wakeRec;
-    wakeRec = null;
-    try { r.onend = null; r.stop(); } catch {}
+  if (wakeRestartTimer) { clearTimeout(wakeRestartTimer); wakeRestartTimer = null; }
+  wakeBackoff = false;
+  wakeDeafRuns = 0;
+  const rec = wakeRec;
+  wakeRec = null;
+  if (rec) {
+    rec.onend = rec.onresult = rec.onerror = null;
+    // abort(), not stop(): stop() keeps the microphone while it finishes
+    // transcribing what it already heard — which is the exact moment
+    // getUserMedia is trying to take it for the session the wake word started.
+    try { rec.abort(); } catch {}
   }
+  setWakeUi();
+}
+
+function setWakeEnabled(on) {
+  // Only the browser backend has these requirements; the service has its own
+  // microphone and doesn't care what this browser can or can't do.
+  if (on && !appConfig.wakeService && (!SpeechRec || insecureContext)) {
+    wakeEnabled = false;
+    wakeNotice = SpeechRec
+      ? "Wake word needs HTTPS — see README"
+      : "Wake word isn't supported in this browser";
+    if (!SpeechRec) wakeBtn.disabled = true;
+    setWakeUi();
+    return;
+  }
+  wakeEnabled = on;
+  try { localStorage.setItem(WAKE_ENABLED_KEY, on ? "1" : "0"); } catch {}
+  if (on) startWakeListening();
+  else stopWakeListening();
+  if (!sessionLive()) setRingState("idle", idlePrompt());
+}
+
+function disableWakeWord(notice) {
+  setWakeEnabled(false);
+  wakeNotice = notice;
+  setWakeUi();
+}
+
+function setWakeUi() {
+  wakeBtn.classList.toggle("active", wakeEnabled);
+  wakeBtn.textContent = wakeEnabled ? "Wake word on" : "Enable wake word";
+  wakeHint.textContent = wakeNotice || WAKE_HINT_TEXT;
+  wakeHint.classList.toggle("notice", Boolean(wakeNotice));
+  // The hint promises that saying "Nova" will do something. Show it whenever
+  // that's true — the quarter-second gap between runs is an implementation
+  // detail, not something to blink at the user.
+  wakeHint.hidden = !wakeNotice && !(wakeEnabled && !sessionLive());
+}
+
+// What the idle ring should say. With the wake word armed there is a hands-free
+// way back in, which is the only one a device with no keyboard or mouse has.
+function idlePrompt() {
+  return wakeEnabled ? "Say “Nova” to wake her" : "Tap the ring to wake Nova";
 }
 
 wakeBtn.addEventListener("click", () => {
-  if (!SpeechRec) {
-    wakeBtn.textContent = "Wake word unsupported here";
-    wakeBtn.disabled = true;
-    return;
-  }
-  wakeEnabled = !wakeEnabled;
-  wakeBtn.classList.toggle("active", wakeEnabled);
-  wakeBtn.textContent = wakeEnabled ? "Wake word on" : "Enable wake word";
-  if (wakeEnabled && !connected) startWakeListening();
-  else stopWakeListening();
+  wakeNotice = "";
+  ctx(); // the one reliable user gesture on a hands-free device: unlock audio
+  setWakeEnabled(!wakeEnabled);
 });
 
 // =====================================================================
@@ -2190,6 +2478,7 @@ function setReadyState() {
   if (sessionMode === "text") setRingState("texting", "Text mode — tap the ring to talk out loud");
   else if (micMuted) setRingState("muted", "Mic muted");
   else setRingState("listening", "Listening — just talk");
+  armIdleTimeout(); // nothing in flight: the silence clock starts here
 }
 
 function setRingState(cls, text) {
@@ -2599,6 +2888,10 @@ loadSchedules();
 renderDevices();
 initLists(); // async: adopts server lists (or offline fallback) and renders
 renderTimers();
+// A device with no keyboard or mouse can't re-arm the wake word after a
+// refresh, a power cut, or the idle timeout — so the setting is remembered and
+// comes back up by itself. Nothing starts listening on a first visit.
+if (localStorage.getItem(WAKE_ENABLED_KEY) === "1") setWakeEnabled(true);
 if (insecureContext) {
   setRingState("idle", "Needs HTTPS for the microphone — see README");
 }

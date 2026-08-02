@@ -46,6 +46,44 @@ export function normalizePinnedDeviceKeys(value) {
   return [...new Set(value.filter(key => typeof key === "string" && key.trim()).map(key => key.trim()))];
 }
 
+// ---- Wake word & idle timeout ----
+
+// The browser's speech recognizer is tuned for phrases, not names, and "Nova"
+// comes back as "no va", "novah" or "Noah" often enough that an exact match
+// misses most of the time. Interim results arrive as a growing phrase, so this
+// looks anywhere in the string rather than anchoring to the start.
+//
+// False positives are cheap on purpose: a wake word only opens a session, and
+// a session nobody talks to now closes itself (see the idle timeout below).
+const WAKE_WORD_RE = /\b(?:no ?va[hs]?|noah|nowa|nofa)\b/;
+
+export function matchesWakeWord(transcript) {
+  // Punctuation and casing vary by engine and by interim-vs-final result;
+  // flatten both so one spelling of the pattern covers every shape.
+  const text = String(transcript || "").toLowerCase().replace(/[^a-z]+/g, " ");
+  return WAKE_WORD_RE.test(text);
+}
+
+// A live Realtime session holds the microphone open and bills by the minute,
+// so one that nobody is talking to has to end by itself — on a device with no
+// keyboard or mouse, nothing else is going to end it.
+export const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
+const MIN_IDLE_TIMEOUT_MS = 10_000;         // below this, a thinking pause reads as idleness
+const MAX_IDLE_TIMEOUT_MS = 30 * 60_000;
+
+// Seconds, from `?idle=` or localStorage — a wall-mounted tablet has no way to
+// edit a constant. "off" disables the timeout; anything unparseable falls back
+// to the default rather than silently leaving a microphone open forever.
+export function readIdleTimeoutMs(raw, fallback = DEFAULT_IDLE_TIMEOUT_MS) {
+  if (raw === null || raw === undefined) return fallback;
+  const text = String(raw).trim().toLowerCase();
+  if (!text) return fallback;
+  if (text === "off" || text === "never" || text === "0") return 0;
+  const seconds = Number(text);
+  if (!Number.isFinite(seconds) || seconds <= 0) return fallback;
+  return Math.min(MAX_IDLE_TIMEOUT_MS, Math.max(MIN_IDLE_TIMEOUT_MS, Math.round(seconds * 1000)));
+}
+
 // ---- Memory archive (Plan 10, Tier C) ----
 
 // A past instant the way a person would say it out loud. Recall results are

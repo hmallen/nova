@@ -265,6 +265,49 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
   // Habit scan cadence. 0 turns Tier D off entirely.
   const HABIT_SCAN_INTERVAL_H = num(env.HABIT_SCAN_INTERVAL_H, 6);
 
+  // ---- Wake word bus ----
+  // The browser cannot run a usable wake word: the Web Speech API needs a
+  // speech backend the Pi's Chromium doesn't have, and even where it works it
+  // can't be pointed at a specific microphone. So detection moves to a local
+  // service (wakeword/nova_wake.py) that owns the mic, and this is the wire
+  // between them — the service POSTs /api/wake, the browser holds an SSE
+  // stream open and starts a session when a wake arrives.
+
+  const wakeClients = new Set();      // open SSE responses
+  const WAKE_SERVICE_STALE_MS = 30_000;
+  // A browser that crashes must not wedge the gate shut forever, so the "a
+  // session is live" flag is a deadline the client refreshes, not a latch.
+  const WAKE_SESSION_TTL_MS = 5 * 60_000;
+  // Nova's own goodbye is still in the air when a session ends. Ignore wakes
+  // for a moment afterwards so she doesn't answer herself.
+  const WAKE_COOLDOWN_MS = 1500;
+  // How long a wake claims the microphone before the browser confirms. Long
+  // enough to cover minting a token and the SDP round-trip on a slow link.
+  const WAKE_HANDOVER_MS = 15_000;
+  let wakeServiceSeenAt = 0;
+  let wakeBlockedUntil = 0;
+  let wakeSessionUntil = 0;
+
+  const wakeServiceLive = () => Date.now() - wakeServiceSeenAt < WAKE_SERVICE_STALE_MS;
+  const wakeGated = () => Date.now() < Math.max(wakeBlockedUntil, wakeSessionUntil);
+
+  // The service runs on the same machine as the server. Lists and memory are
+  // already LAN-readable by design, but "open the microphone" is a different
+  // kind of verb — keep it to loopback rather than letting anything on the
+  // network start a session in someone's kitchen.
+  function fromLoopback(req) {
+    const addr = req.socket?.remoteAddress || "";
+    return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+  }
+
+  function broadcastWake(payload) {
+    const frame = `event: wake\ndata: ${JSON.stringify(payload)}\n\n`;
+    for (const res of wakeClients) {
+      try { res.write(frame); } catch { wakeClients.delete(res); }
+    }
+    return wakeClients.size;
+  }
+
   // ---- Memory archive (Plan 10, Tier C) ----
 
   // Last sign of a live session. The habit pass reads month files, and there
@@ -859,7 +902,97 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
           calendarWritable: gcal.connected(),
           googleConfigured: gcal.configured,
           radio: Object.keys(radioStreams).map(name => ({ name })),
+          // Tells the client which wake-word backend to use: the local service
+          // if it has checked in recently, the browser's own recognizer if not.
+          wakeService: wakeServiceLive(),
         }));
+        return;
+      }
+
+      // ---- Wake word bus ----
+
+      // The browser's end: one long-lived stream per open tab.
+      if (req.method === "GET" && req.url.split("?")[0] === "/api/events") {
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no", // in case anyone puts a proxy in front
+        });
+        res.write("retry: 2000\n\n");
+        res.write(`event: hello\ndata: ${JSON.stringify({ wakeService: wakeServiceLive() })}\n\n`);
+        wakeClients.add(res);
+        // Without traffic, an idle stream is indistinguishable from a dead one
+        // to anything in the middle. A comment line is not an event.
+        const beat = setInterval(() => {
+          try { res.write(": beat\n\n"); } catch {}
+        }, 25_000);
+        const drop = () => { clearInterval(beat); wakeClients.delete(res); };
+        req.on("close", drop);
+        req.on("error", drop);
+        return;
+      }
+
+      // The service's end: a ping to say it's alive, a wake to fire.
+      if (req.method === "POST" && req.url.split("?")[0] === "/api/wake") {
+        if (!fromLoopback(req)) { res.writeHead(403); res.end(); return; }
+        let body = {};
+        try { body = JSON.parse(await readBody(req) || "{}"); } catch {}
+        wakeServiceSeenAt = Date.now();
+        if (body.event === "ping") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, listeners: wakeClients.size }));
+          return;
+        }
+        // A wake that lands while Nova is already listening is not a wake —
+        // it's Nova hearing herself, or someone saying her name mid-sentence.
+        if (wakeGated()) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, ignored: "session-active", listeners: 0 }));
+          return;
+        }
+        const listeners = broadcastWake({
+          at: Date.now(),
+          heard: typeof body.heard === "string" ? body.heard.slice(0, 100) : undefined,
+        });
+        // Claim the microphone for the browser now rather than when it gets
+        // around to confirming: the service polls this to decide when to let
+        // go of the device, and until it does, getUserMedia can't have it.
+        // The browser either confirms (extending the window) or reports the
+        // session closed (clearing it), so an optimistic claim can't stick.
+        if (listeners) wakeSessionUntil = Date.now() + WAKE_HANDOVER_MS;
+        console.log(`  wake: ${listeners} listener(s)${listeners ? "" : " — no browser is open"}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, listeners }));
+        return;
+      }
+
+      // The service polls this to know when to release the microphone. On a
+      // Pi, PortAudio usually opens the raw ALSA device, which locks the whole
+      // card — so "gated" has to mean "close the stream", not just "ignore
+      // what you hear", or the browser gets neither capture nor playback.
+      if (req.method === "GET" && req.url.split("?")[0] === "/api/wake/state") {
+        if (!fromLoopback(req)) { res.writeHead(403); res.end(); return; }
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify({ active: wakeGated(), listeners: wakeClients.size }));
+        return;
+      }
+
+      // The browser tells us when it is holding a session, so the gate above
+      // knows. Loopback-only too: it can only ever suppress wakes, but there
+      // is no reason for it to be reachable from the network.
+      if (req.method === "POST" && req.url.split("?")[0] === "/api/wake/session") {
+        if (!fromLoopback(req)) { res.writeHead(403); res.end(); return; }
+        let body = {};
+        try { body = JSON.parse(await readBody(req) || "{}"); } catch {}
+        if (body.active) {
+          wakeSessionUntil = Date.now() + WAKE_SESSION_TTL_MS;
+        } else {
+          wakeSessionUntil = 0;
+          wakeBlockedUntil = Date.now() + WAKE_COOLDOWN_MS;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, gated: wakeGated() }));
         return;
       }
 
@@ -1255,7 +1388,13 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
   // after the response that triggered them; tests and any future manual
   // trigger need a way in that doesn't involve waiting for either.
   server.novaMemory = { runHabitScan, runSweep, settled: () => archiveWrites };
-  server.on("close", () => { if (scanTimer) clearInterval(scanTimer); });
+  server.on("close", () => {
+    if (scanTimer) clearInterval(scanTimer);
+    // An SSE stream is a connection that never ends on its own — close() would
+    // wait for it forever, which in a test looks like a hung suite.
+    for (const res of wakeClients) { try { res.end(); } catch {} }
+    wakeClients.clear();
+  });
   return server;
 }
 

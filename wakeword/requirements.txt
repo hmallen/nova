@@ -1,0 +1,8 @@
+# Nova wake-word service. Two packages; everything else is stdlib.
+#
+# vosk        offline speech recognition (Apache-2.0). Ships prebuilt aarch64
+#             wheels, so there is nothing to compile on a Raspberry Pi.
+# sounddevice PortAudio binding for capturing the microphone. Needs the
+#             libportaudio2 system package — setup.sh installs it.
+vosk==0.3.45
+sounddevice==0.5.1

@@ -1,0 +1,31 @@
+# Nova wake-word service, started at boot.
+#
+#   sudo cp nova-wake.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nova-wake
+#   journalctl -u nova-wake -f
+#
+# Adjust User and the two paths if Nova doesn't live in /home/pi/nova.
+
+[Unit]
+Description=Nova wake-word service
+# Not Requires=: the wake word survives the server restarting under it, and
+# refusing to start just because Nova is down would need a manual recovery.
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/nova/wakeword
+ExecStart=/home/pi/nova/wakeword/.venv/bin/python nova_wake.py
+Restart=always
+RestartSec=5
+# PortAudio needs a session bus to reach PipeWire/PulseAudio. Without this the
+# service starts, opens a device, and captures nothing but silence.
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
