@@ -65,6 +65,8 @@ journalctl -u nova-wake -f
 |---|---|---|
 | `--server` | `https://localhost:3000` | Nova's base URL |
 | `--device` | system default | Input device index from `--list-devices` |
+| `--rate` | negotiated | Force a capture sample rate |
+| `--channels` | negotiated | Force a channel count |
 | `--phrase` | `nova`, `hey nova`, `okay nova` | Repeatable |
 | `--model` | `models/vosk-model-small-en-us-0.15` | Any Vosk model directory |
 | `--verify-tls` | off | Off because the link is loopback and the certificate is usually mkcert's |
@@ -72,6 +74,15 @@ journalctl -u nova-wake -f
 | `--self-test` | — | Check the matching rules; no mic, model or server needed |
 
 ## Troubleshooting
+
+**`Invalid sample rate [PaErrorCode -9997]`.** The microphone won't run at the
+rate being asked for. The service negotiates this now — it prefers 16 kHz
+because that is the model's native rate, then falls back to the device's own
+default and the other common rates — so this should not happen. If it still
+does, the startup line prints what it settled on, and `--rate 48000` (or
+whatever `--list-devices` reports) forces the issue. The same negotiation
+covers microphone arrays that refuse mono: it opens them at their full channel
+count and takes the first channel.
 
 **Nothing happens when I say "Nova".** Run with `--verbose`. If no transcripts
 appear at all, the microphone is wrong — `--list-devices` and pass `--device`.
