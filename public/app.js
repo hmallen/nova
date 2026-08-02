@@ -1355,6 +1355,27 @@ async function fetchSessionToken() {
   return resp;
 }
 
+// The wake-word service owns the microphone until it sees that Nova wants it,
+// which it learns by polling — so for a moment after a wake, the device can
+// still be busy. Wait it out rather than reporting a blocked microphone at the
+// exact moment the user has just spoken to us.
+async function openMicrophone(attempts = 6, waitMs = 250) {
+  const constraints = {
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  };
+  for (let i = 0; ; i++) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (err) {
+      // Busy is worth retrying; denied never fixes itself on a timer.
+      const busy = err?.name === "NotReadableError" || err?.name === "AbortError";
+      if (!busy || i >= attempts - 1) throw err;
+      setRingState("connecting", "Waiting for the microphone…");
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+}
+
 async function startSession() {
   // Before anything touches the microphone: the wake-word recognizer holds it
   // too, and getUserMedia has to find it free.
@@ -1382,9 +1403,7 @@ async function startSession() {
     if (sessionMode === "text") {
       pc.addTransceiver("audio", { direction: "recvonly" });
     } else {
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
+      micStream = await openMicrophone();
       pc.addTrack(micStream.getTracks()[0], micStream);
     }
 

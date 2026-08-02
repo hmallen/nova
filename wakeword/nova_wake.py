@@ -39,10 +39,14 @@ DEFAULT_SERVER = "https://localhost:3000"
 DEFAULT_MODEL = "models/vosk-model-small-en-us-0.15"
 DEFAULT_PHRASES = ["nova", "hey nova", "okay nova"]
 
-# One utterance should fire once. Vosk emits a growing partial as you speak, so
-# without this a single "Nova" reports two or three times.
-REFRACTORY_S = 2.5
 PING_EVERY_S = 10.0
+# How often to ask whether Nova wants the microphone. Fast enough that tapping
+# the ring doesn't hit a busy device for long, slow enough to stay invisible.
+YIELD_POLL_S = 0.5
+# Handing the microphone over ends an utterance naturally, but a wake that is
+# *not* handed over (Nova already listening, or no browser open) leaves "nova"
+# sitting in the partial transcript, which would otherwise re-fire every chunk.
+REFRACTORY_S = 2.5
 BLOCK_SECONDS = 0.25  # small enough to keep detection prompt at any rate
 
 # The model is trained at 16 kHz, so that is worth asking for first — Vosk
@@ -182,11 +186,28 @@ class NovaLink:
                 self._warned = True
             return None
 
+    def get(self, path: str) -> dict | None:
+        try:
+            kwargs = {"timeout": 5}
+            if self.ctx is not None and self.base.startswith("https"):
+                kwargs["context"] = self.ctx
+            with urllib.request.urlopen(self.base + path, **kwargs) as resp:
+                return json.loads(resp.read().decode("utf-8") or "{}")
+        except Exception:  # noqa: BLE001
+            return None
+
     def ping(self) -> dict | None:
         return self.post("/api/wake", {"event": "ping"})
 
     def wake(self, heard: str) -> dict | None:
         return self.post("/api/wake", {"event": "wake", "heard": heard})
+
+    def microphone_wanted_by_nova(self) -> bool:
+        """True while a session is live (or just ended) and we must stay off
+        the device. A server we can't reach isn't holding the microphone, so
+        the safe answer when it's down is False — keep listening."""
+        state = self.get("/api/wake/state")
+        return bool(state and state.get("active"))
 
 
 # ---- main loop ------------------------------------------------------------
@@ -258,67 +279,128 @@ def run(args) -> int:
     print(f"Nova wake word: listening for {', '.join(repr(p) for p in phrases)}")
     print(f"  model  {args.model}")
     print(f"  server {args.server}")
-    print(f"  input  {info.get('name', '?')} — {rate} Hz, {channels} ch"
+    device_name = str(info.get("name", "?"))
+    print(f"  input  {device_name} - {rate} Hz, {channels} ch"
           f"{' (using channel 1)' if channels > 1 else ''}")
+    # A raw ALSA device is exclusive: holding it locks the entire sound card,
+    # so Nova gets no speakers either — no timer chime, no radio, nothing —
+    # even while this is only sitting there waiting for a wake word.
+    if re.search(r"\(hw:\d", device_name):
+        print("  ! this is a raw ALSA device, which locks the whole sound card.")
+        print("    Nova won't be able to play audio while this is listening.")
+        print("    Prefer a shared one: --device pulse (or 'default').")
     link.ping()
 
-    last_ping = time.monotonic()
-    muted_until = 0.0
-    heard_anything = False
-    started = time.monotonic()
+    # Only a busy or missing device is worth retrying. Anything else is a bug,
+    # and a bug that gets retried forever reads as "the microphone is broken"
+    # — which is precisely the kind of silent failure this whole feature has
+    # already burned three rounds on.
+    audio_errors = (getattr(sd, "PortAudioError", OSError), OSError)
 
-    with sd.RawInputStream(
-        samplerate=rate,
-        blocksize=int(rate * BLOCK_SECONDS),
-        device=args.device,
-        dtype="int16",
-        channels=channels,
-        callback=on_audio,
-    ):
-        while True:
-            chunk = to_mono_16bit(audio.get(), channels)
-            now = time.monotonic()
+    state = {"heard_anything": False, "warned_silent": False, "last_ping": time.monotonic()}
 
-            if now - last_ping >= PING_EVERY_S:
-                last_ping = now
-                link.ping()
+    def listen(stream_factory):
+        """Own the microphone until a wake fires or Nova wants the device.
 
-            # The same silence trap the browser fell into, reported rather than
-            # left to look like a broken feature: if the stream is delivering
-            # nothing but digital silence, the microphone is the wrong one.
-            if not heard_anything:
-                if any(chunk):  # int16 LE bytes; all-zero means digital silence
-                    heard_anything = True
-                elif now - started > 30:
-                    print("  ! 30 s of pure silence — is --device the right microphone?",
-                          file=sys.stderr)
-                    print("    List them with --list-devices.", file=sys.stderr)
-                    started = float("inf")  # say it once
+        Returns the reason, which is also why this closes over a factory
+        instead of holding one long-lived stream: on a Pi, PortAudio opens the
+        raw ALSA device, which locks the entire sound card. Merely ignoring
+        what we hear would still leave Chromium with no microphone *and* no
+        speakers. The stream has to actually close.
+        """
+        opened = time.monotonic()
+        muted_until = 0.0
+        with stream_factory():
+            while True:
+                chunk = to_mono_16bit(audio.get(), channels)
+                now = time.monotonic()
 
-            if now < muted_until:
+                if now - state["last_ping"] >= PING_EVERY_S:
+                    state["last_ping"] = now
+                    link.ping()
+
+                # Checked on a timer rather than per chunk: this is an HTTP
+                # round trip, and chunks arrive four times a second.
+                if now - opened >= YIELD_POLL_S:
+                    opened = now
+                    if link.microphone_wanted_by_nova():
+                        return "nova"
+
+                # The same silence trap the browser fell into, reported rather
+                # than left to look like a broken feature: a stream delivering
+                # nothing but digital silence is the wrong microphone.
+                if not state["heard_anything"]:
+                    if any(chunk):  # int16 LE; all-zero means digital silence
+                        state["heard_anything"] = True
+                    elif now - start_time > 30 and not state["warned_silent"]:
+                        state["warned_silent"] = True
+                        print("  ! 30 s of pure silence — is --device the right microphone?",
+                              file=sys.stderr)
+                        print("    List them with --list-devices.", file=sys.stderr)
+
+                if now < muted_until:
+                    recognizer.Reset()
+                    continue
+
+                if recognizer.AcceptWaveform(chunk):
+                    text = json.loads(recognizer.Result()).get("text", "")
+                else:
+                    text = json.loads(recognizer.PartialResult()).get("partial", "")
+                if not text:
+                    continue
+                if args.verbose:
+                    print(f"  heard {text!r}")
+                if not matches_wake_word(text):
+                    continue
+
+                print(f"  wake <- {text!r}")
+                reply = link.wake(text)
+                if reply and reply.get("ignored"):
+                    print(f"    (ignored: {reply['ignored']})")
+                elif reply and not reply.get("listeners"):
+                    print("    (no browser has Nova open)")
+                else:
+                    return "wake"
+                # Not handed over, so this stream keeps the device. Mute long
+                # enough for the utterance to pass instead of re-firing on the
+                # same partial four times a second.
+                muted_until = now + REFRACTORY_S
                 recognizer.Reset()
-                continue
 
-            text = ""
-            if recognizer.AcceptWaveform(chunk):
-                text = json.loads(recognizer.Result()).get("text", "")
-            else:
-                text = json.loads(recognizer.PartialResult()).get("partial", "")
-            if not text:
-                continue
-            if args.verbose:
-                print(f"  heard {text!r}")
-            if not matches_wake_word(text):
-                continue
+    def new_stream():
+        return sd.RawInputStream(
+            samplerate=rate,
+            blocksize=int(rate * BLOCK_SECONDS),
+            device=args.device,
+            dtype="int16",
+            channels=channels,
+            callback=on_audio,
+        )
 
-            print(f"  wake ← {text!r}")
-            reply = link.wake(text)
-            if reply and reply.get("ignored"):
-                print(f"    (ignored: {reply['ignored']})")
-            elif reply and not reply.get("listeners"):
-                print("    (no browser has Nova open)")
-            muted_until = now + REFRACTORY_S
-            recognizer.Reset()
+    start_time = time.monotonic()
+    while True:
+        try:
+            why = listen(new_stream)
+        except audio_errors as err:
+            print(f"  ! microphone unavailable ({err}); retrying", file=sys.stderr)
+            time.sleep(YIELD_POLL_S)
+            continue
+
+        if why == "wake":
+            print("    handing the microphone to Nova")
+        # Drain whatever the callback queued before the stream closed, so the
+        # next session doesn't start by recognizing stale audio.
+        while not audio.empty():
+            audio.get_nowait()
+        recognizer.Reset()
+
+        # Stay off the device until Nova is done with it.
+        while link.microphone_wanted_by_nova():
+            time.sleep(YIELD_POLL_S)
+            if time.monotonic() - state["last_ping"] >= PING_EVERY_S:
+                state["last_ping"] = time.monotonic()
+                link.ping()
+        print("  listening again")
 
 
 def self_test() -> int:
@@ -393,10 +475,22 @@ def self_test() -> int:
 
 
 def main() -> int:
+    # systemd gives a service whatever locale it inherits, which is often not
+    # UTF-8 — and a print() that raises UnicodeEncodeError inside the capture
+    # loop looks exactly like a hardware fault. Don't let text kill audio.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 — older Python, or a stream that can't
+            pass
+
     p = argparse.ArgumentParser(description="Nova offline wake-word service")
     p.add_argument("--server", default=DEFAULT_SERVER, help=f"Nova base URL (default {DEFAULT_SERVER})")
     p.add_argument("--model", default=DEFAULT_MODEL, help="path to the Vosk model directory")
-    p.add_argument("--device", type=int, default=None, help="input device index (--list-devices)")
+    p.add_argument("--device", default=None,
+                   help="input device index or name (--list-devices). A shared device "
+                        "like 'pulse' or 'default' lets Nova use the speakers at the "
+                        "same time; a raw 'hw:' device locks the whole card")
     p.add_argument("--rate", type=int, default=None,
                    help="force a capture sample rate (default: negotiate with the device)")
     p.add_argument("--channels", type=int, default=None,
@@ -411,6 +505,9 @@ def main() -> int:
 
     if args.self_test:
         return self_test()
+    # sounddevice takes an index or a name; argparse only ever hands us text.
+    if isinstance(args.device, str) and args.device.strip().lstrip("-").isdigit():
+        args.device = int(args.device)
     try:
         return run(args)
     except KeyboardInterrupt:

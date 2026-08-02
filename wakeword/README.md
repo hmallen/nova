@@ -30,6 +30,26 @@ The server drops any wake that arrives while a session is already live, so Nova
 never answers her own voice, and the browser only acts on wake events when the
 device has the wake word switched on.
 
+### The microphone handover
+
+Two processes cannot share one microphone on a Pi. PortAudio opens the ALSA
+device directly, and a raw device is *exclusive* — holding it locks the entire
+sound card, so the browser gets neither a microphone nor speakers.
+
+So the service does not merely ignore what it hears while Nova is talking to
+you; it **closes the audio stream**. On a wake it hands the device over
+immediately, before the browser has even asked for it. For a session started
+another way — tapping the ring — it notices within half a second by polling
+`/api/wake/state`, and the browser retries `getUserMedia` for a moment to cover
+the gap. When the session ends it takes the device back and says
+`listening again`.
+
+One thing that handover does **not** cover: while idle, the service is still
+holding the card, so if you point it at a raw `hw:` device Nova can't play a
+timer chime either. Use a shared device — `--device pulse` (or `default`),
+which routes through PipeWire and lets both processes have it at once. The
+service warns at startup if the device it opened looks raw.
+
 ## Setup
 
 ```bash
@@ -64,7 +84,7 @@ journalctl -u nova-wake -f
 | Flag | Default | Notes |
 |---|---|---|
 | `--server` | `https://localhost:3000` | Nova's base URL |
-| `--device` | system default | Input device index from `--list-devices` |
+| `--device` | system default | Index *or name* from `--list-devices`. Prefer `pulse`/`default` over a raw `hw:` device |
 | `--rate` | negotiated | Force a capture sample rate |
 | `--channels` | negotiated | Force a channel count |
 | `--phrase` | `nova`, `hey nova`, `okay nova` | Repeatable |
@@ -93,6 +113,14 @@ recognizer is tuned for phrases rather than names and "Nova" comes back as
 "no va" or "Noah" often enough that exact matching misses. A false trigger is
 cheap: it opens a session, which closes itself after a minute of silence.
 Narrow it in `WAKE_RE` in `nova_wake.py` if it bothers you.
+
+**Nova goes deaf once a session starts, or I can't hear her.** The service is
+still holding the sound card. It is meant to let go — see *The microphone
+handover* above; the log says `handing the microphone to Nova` and then
+`listening again`. If neither line appears, the service can't reach the server
+to find out that Nova wants the device: check `--server` matches where Nova
+actually runs, including `https` vs `http`. If they do appear and it still
+happens, you are on a raw `hw:` device — switch to `--device pulse`.
 
 **It works from a terminal but not under systemd.** Almost always
 `XDG_RUNTIME_DIR` — PortAudio needs a session bus to reach PipeWire. The unit

@@ -701,3 +701,60 @@ test("wake endpoints are loopback-only", async (t) => {
     assert.equal(local.status, 200, `${path} should accept a loopback caller`);
   }
 });
+
+// A wake has to claim the microphone straight away. The service polls
+// /api/wake/state to decide when to close its audio stream, and on a Pi that
+// stream holds the raw ALSA device, which locks the whole sound card — so
+// waiting for the browser to confirm the session would leave getUserMedia
+// fighting a busy device, and Nova with no speakers either.
+// Its own server: the claim lasts 15 s, which would leak into other subtests.
+test("a wake claims the microphone for the browser", async (t) => {
+  const server = createNovaServer({ env: { OPENAI_API_KEY: "sk-test" }, dataDir: tmpDataDir() });
+  const base = await listen(server);
+  t.after(() => server.close());
+
+  assert.equal((await fetch(base + "/api/wake/state").then(r => r.json())).active, false);
+
+  const stream = await openEventStream(base);
+  await stream.next(); // hello
+  await postJson(base, "/api/wake", { event: "wake" });
+
+  const claimed = await fetch(base + "/api/wake/state").then(r => r.json());
+  assert.equal(claimed.active, true, "a wake should claim the microphone");
+  assert.equal(claimed.listeners, 1);
+
+  // A session that never materialises must not strand the claim.
+  await postJson(base, "/api/wake/session", { active: false });
+  await new Promise(r => setTimeout(r, 1600)); // past the cooldown
+  assert.equal((await fetch(base + "/api/wake/state").then(r => r.json())).active, false,
+    "the claim must clear once Nova is done");
+
+  stream.close();
+});
+
+test("a wake with nobody listening leaves the microphone alone", async (t) => {
+  // Nothing to hand it to, so the service should just keep listening.
+  const server = createNovaServer({ env: { OPENAI_API_KEY: "sk-test" }, dataDir: tmpDataDir() });
+  const base = await listen(server);
+  t.after(() => server.close());
+
+  const resp = await postJson(base, "/api/wake", { event: "wake" }).then(r => r.json());
+  assert.equal(resp.listeners, 0);
+  assert.equal((await fetch(base + "/api/wake/state").then(r => r.json())).active, false);
+});
+
+test("wake state is loopback-only too", async (t) => {
+  const external = Object.values(os.networkInterfaces())
+    .flat()
+    .find(a => a && a.family === "IPv4" && !a.internal);
+  if (!external) { t.diagnostic("no external IPv4 interface; skipping"); return; }
+
+  const server = createNovaServer({ env: { OPENAI_API_KEY: "sk-test" }, dataDir: tmpDataDir() });
+  const port = await new Promise((resolve) =>
+    server.listen(0, "0.0.0.0", () => resolve(server.address().port))
+  );
+  t.after(() => server.close());
+
+  assert.equal((await fetch(`http://${external.address}:${port}/api/wake/state`)).status, 403);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/api/wake/state`)).status, 200);
+});

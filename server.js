@@ -281,6 +281,9 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
   // Nova's own goodbye is still in the air when a session ends. Ignore wakes
   // for a moment afterwards so she doesn't answer herself.
   const WAKE_COOLDOWN_MS = 1500;
+  // How long a wake claims the microphone before the browser confirms. Long
+  // enough to cover minting a token and the SDP round-trip on a slow link.
+  const WAKE_HANDOVER_MS = 15_000;
   let wakeServiceSeenAt = 0;
   let wakeBlockedUntil = 0;
   let wakeSessionUntil = 0;
@@ -952,9 +955,26 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
           at: Date.now(),
           heard: typeof body.heard === "string" ? body.heard.slice(0, 100) : undefined,
         });
+        // Claim the microphone for the browser now rather than when it gets
+        // around to confirming: the service polls this to decide when to let
+        // go of the device, and until it does, getUserMedia can't have it.
+        // The browser either confirms (extending the window) or reports the
+        // session closed (clearing it), so an optimistic claim can't stick.
+        if (listeners) wakeSessionUntil = Date.now() + WAKE_HANDOVER_MS;
         console.log(`  wake: ${listeners} listener(s)${listeners ? "" : " — no browser is open"}`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, listeners }));
+        return;
+      }
+
+      // The service polls this to know when to release the microphone. On a
+      // Pi, PortAudio usually opens the raw ALSA device, which locks the whole
+      // card — so "gated" has to mean "close the stream", not just "ignore
+      // what you hear", or the browser gets neither capture nor playback.
+      if (req.method === "GET" && req.url.split("?")[0] === "/api/wake/state") {
+        if (!fromLoopback(req)) { res.writeHead(403); res.end(); return; }
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify({ active: wakeGated(), listeners: wakeClients.size }));
         return;
       }
 
