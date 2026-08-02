@@ -18,6 +18,13 @@ parallel.
 | 9 | [Persistent memory: profile facts & session rollover](09-persistent-memory.md) | 2, 3, 5 | L |
 | 10 | [Memory archive & learned habits](10-memory-archive-and-habits.md) | 9, 3, 4 (soft) | L |
 
+Plans 9 and 10 are shipped. Two of plan 10's "Before you start" questions can
+only be answered by a household that has been running it for a while, so the
+code reports them instead of assuming: the boot log prints the archive's size
+per month, a recall over a month file past ~50k rows warns that the substring
+scan has outgrown itself, and every `recall_memory` call is logged with its
+arguments so the "does it fire on ordinary turns?" question has data behind it.
+
 ## Suggested order
 
 1. **Tier 1 (foundation):** Plans 1, 2, 3 — they extend the existing skill

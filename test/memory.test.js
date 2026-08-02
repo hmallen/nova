@@ -10,6 +10,13 @@ import {
   dropUntrustedTurns,
   rolloverForSession,
   renderRolloverText,
+  mergeSuggestions,
+  acceptSuggestion,
+  dismissSuggestion,
+  askSuggestion,
+  pendingSuggestions,
+  setFactStale,
+  MAX_PENDING_SUGGESTIONS,
   MAX_FACTS,
   MAX_FACT_CHARS,
   MAX_FACT_BLOCK_CHARS,
@@ -258,4 +265,149 @@ test("renderRolloverText drops the oldest lines to stay inside the budget", () =
   assert.ok(text.length <= MAX_ROLLOVER_CHARS + 200, `rendered ${text.length} chars`);
   assert.ok(text.includes("User: 7 "), "the newest turn is kept");
   assert.ok(!text.includes("User: 0 "), "the oldest turn went");
+});
+
+// ---- habit suggestions (Tier D) ----
+
+function suggestionClock(startMs = Date.parse("2026-08-02T03:00:00Z")) {
+  let tick = 0;
+  return { now: () => startMs + tick++ * 1000, id: () => `s_${String(++tick).padStart(3, "0")}` };
+}
+
+const habit = (extra = {}) => ({
+  rule: "time_of_day", key: "get_weather",
+  text: "You usually ask for the weather around 7am",
+  support: { n: 8, of: 21 },
+  ...extra,
+});
+
+test("mergeSuggestions proposes a pending suggestion with readable support", () => {
+  const { suggestions, added } = mergeSuggestions([], [habit()], suggestionClock());
+  assert.equal(added, 1);
+  assert.equal(suggestions[0].status, "pending");
+  assert.equal(suggestions[0].support, "8/21");
+  assert.equal(suggestions[0].rule, "time_of_day");
+  assert.match(suggestions[0].proposedAt, /^2026-08-02T/);
+});
+
+test("a still-pending suggestion is refreshed in place, keeping its id", () => {
+  const first = mergeSuggestions([], [habit()], suggestionClock()).suggestions;
+  const again = mergeSuggestions(first, [habit({ support: { n: 11, of: 21 } })], suggestionClock());
+  assert.equal(again.added, 0);
+  assert.equal(again.suggestions.length, 1);
+  assert.equal(again.suggestions[0].id, first[0].id, "the card the user is looking at doesn't change id");
+  assert.equal(again.suggestions[0].support, "11/21");
+});
+
+test("a dismissed pattern never comes back", () => {
+  const clock = suggestionClock();
+  const proposed = mergeSuggestions([], [habit()], clock).suggestions;
+  const { suggestions: after } = dismissSuggestion(proposed, proposed[0].id, clock);
+  assert.equal(after[0].status, "dismissed");
+
+  const rescan = mergeSuggestions(after, [habit()], clock);
+  assert.equal(rescan.added, 0);
+  assert.deepEqual(pendingSuggestions(rescan.suggestions), []);
+});
+
+test("dismiss rejects an unknown or already-resolved id", () => {
+  const proposed = mergeSuggestions([], [habit()], suggestionClock()).suggestions;
+  assert.match(dismissSuggestion(proposed, "s_nope").error, /no pending suggestion/i);
+  const dismissed = dismissSuggestion(proposed, proposed[0].id).suggestions;
+  assert.match(dismissSuggestion(dismissed, proposed[0].id).error, /no pending suggestion/i);
+});
+
+test("the pending list is bounded so a noisy scan can't bury the card", () => {
+  const many = Array.from({ length: MAX_PENDING_SUGGESTIONS + 5 }, (_, i) =>
+    habit({ key: `tool_${i}` }));
+  const { suggestions } = mergeSuggestions([], many, suggestionClock());
+  assert.equal(pendingSuggestions(suggestions).length, MAX_PENDING_SUGGESTIONS);
+});
+
+test("Nova raises each suggestion out loud exactly once", () => {
+  const clock = suggestionClock();
+  const proposed = mergeSuggestions([], [habit(), habit({ key: "get_news", text: "News at 8am" })], clock).suggestions;
+
+  const first = askSuggestion(proposed, clock);
+  assert.equal(first.suggestion.key, "get_weather");
+  assert.match(first.suggestion.askedAt, /^2026-08-02T/);
+
+  const second = askSuggestion(first.suggestions, clock);
+  assert.equal(second.suggestion.key, "get_news", "the next routine gets the next one, not a repeat");
+
+  // Both asked and neither answered: nothing more to say, and both stay
+  // pending so the card still has them.
+  assert.deepEqual(askSuggestion(second.suggestions, clock), { suggestion: null });
+  assert.equal(pendingSuggestions(second.suggestions).length, 2);
+});
+
+test("an asked-but-unanswered suggestion keeps its stamp through a rescan", () => {
+  const clock = suggestionClock();
+  const proposed = mergeSuggestions([], [habit()], clock).suggestions;
+  const asked = askSuggestion(proposed, clock).suggestions;
+  const rescanned = mergeSuggestions(asked, [habit({ support: { n: 10, of: 21 } })], clock).suggestions;
+  assert.ok(rescanned[0].askedAt, "a refreshed support figure is not a licence to ask again");
+  assert.equal(rescanned[0].support, "10/21");
+});
+
+// ---- accept: the one path from a noticed pattern into the prompt ----
+
+test("accepting writes a derived fact that carries its rule and support", () => {
+  const clock = suggestionClock();
+  const suggestions = mergeSuggestions([], [habit()], clock).suggestions;
+  const result = acceptSuggestion({ facts: [], suggestions }, suggestions[0].id, clock);
+
+  assert.equal(result.fact.source, "derived");
+  assert.equal(result.fact.rule, "time_of_day");
+  assert.equal(result.fact.key, "get_weather");
+  assert.equal(result.fact.support, "8/21");
+  assert.equal(result.fact.stale, false);
+  assert.equal(result.suggestions[0].status, "accepted");
+  assert.equal(result.suggestions[0].factId, result.fact.id);
+});
+
+test("an accepted pattern is not proposed again", () => {
+  const clock = suggestionClock();
+  const proposed = mergeSuggestions([], [habit()], clock).suggestions;
+  const { suggestions } = acceptSuggestion({ facts: [], suggestions: proposed }, proposed[0].id, clock);
+  assert.equal(mergeSuggestions(suggestions, [habit()], clock).added, 0);
+});
+
+test("accept rejects an unknown id and writes nothing", () => {
+  const suggestions = mergeSuggestions([], [habit()], suggestionClock()).suggestions;
+  const result = acceptSuggestion({ facts: [], suggestions }, "s_nope");
+  assert.match(result.error, /no pending suggestion/i);
+  assert.equal(result.facts, undefined);
+});
+
+test("a pending suggestion is not in the prompt block; an accepted one is", () => {
+  const clock = suggestionClock();
+  const proposed = mergeSuggestions([], [habit()], clock).suggestions;
+  // Suggestions live in their own array — there is no path by which an
+  // unaccepted one reaches the model.
+  assert.deepEqual(factsForPrompt([]).facts, []);
+
+  const { facts } = acceptSuggestion({ facts: [], suggestions: proposed }, proposed[0].id, clock);
+  assert.deepEqual(factsForPrompt(facts).facts.map(f => f.text), [
+    "You usually ask for the weather around 7am",
+  ]);
+});
+
+test("a stale derived fact leaves the prompt but stays in the file", () => {
+  const clock = suggestionClock();
+  const proposed = mergeSuggestions([], [habit()], clock).suggestions;
+  const { facts } = acceptSuggestion({ facts: [], suggestions: proposed }, proposed[0].id, clock);
+
+  const retired = setFactStale(facts, facts[0].id, true);
+  assert.equal(retired.length, 1, "kept on disk — a habit resuming should restore it");
+  assert.deepEqual(factsForPrompt(retired).facts, []);
+
+  // And restoring it is symmetrical.
+  assert.deepEqual(factsForPrompt(setFactStale(retired, facts[0].id, false)).facts.length, 1);
+});
+
+test("setFactStale returns the same array when nothing changes", () => {
+  const facts = seed(["Allergic to shellfish"]);
+  assert.equal(setFactStale(facts, facts[0].id, false), facts);
+  assert.equal(setFactStale(facts, "f_nope", true), facts);
 });
