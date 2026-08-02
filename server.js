@@ -21,6 +21,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createStore } from "./lib/store.js";
 import { parseRss } from "./lib/rss.js";
 import { parseIcs, expandEvents } from "./lib/ics.js";
+import {
+  createGoogleCalendar,
+  buildEventResource,
+  isValidTimeZone,
+  isoToLocal,
+  GoogleCalendarError,
+} from "./lib/gcal.js";
 import { parseEnv, applyEnv } from "./lib/env.js";
 import { sanitizePrefs, buildAboutBlock } from "./lib/prefs.js";
 import {
@@ -126,6 +133,17 @@ Capabilities:
   making phone calls, ordering products), say so briefly and, when possible,
   offer the closest thing you can do, such as an ambient sound instead of music.
 
+Calendar:
+- When you add or change an event, repeat the title and the time back in your
+  confirmation ("Added dentist, Thursday at two thirty") so a misheard time is
+  caught immediately.
+- Cancelling an event cannot be undone. Before calling cancel_calendar_event,
+  name the specific event and get a clear yes — and if the calendar has more
+  than one event that matches what they said, ask which one rather than
+  guessing.
+- If the user gives a day but no time, ask for the time rather than inventing
+  one. If they give a time but no duration, just book an hour.
+
 The user may address you as "Nova". Do not mention OpenAI, models, tools, or
 function names — you are simply Nova.
 
@@ -158,6 +176,14 @@ remember with action "accept" and that suggestion's id. If they say no, call it
 with action "dismiss". If they ignore it or change the subject, let it go
 without asking again.
 `.trim();
+
+// The OAuth callback is the only HTML this server generates, and it echoes
+// query parameters that arrive from a redirect. Escape them.
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
 
 // Read a small JSON request body (session prefs, list sync, HA calls).
 function readBody(req, limit = 64 * 1024) {
@@ -440,32 +466,122 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
     });
   }
 
-  // Calendar (read-only ICS feed).
+  // Calendar. Two halves that answer different questions:
+  //
+  //   ICS_URL          — a subscription feed. HTTP GET, so read-only forever.
+  //   Google Calendar  — OAuth, and the only one of the two that can be
+  //                      written to. When connected it is also the better
+  //                      reader: Google expands recurrence server-side, which
+  //                      lib/ics.js only approximates.
+  //
+  // Reads merge whichever are available (a household may point ICS_URL at a
+  // work calendar and connect Google for the personal one); writes always go
+  // to Google, because nothing else here can accept them.
   const ICS_URL = env.ICS_URL || "";
   const ICS_CACHE_MS = 15 * 60 * 1000;
   let icsCache = null; // { at, text }
 
-  async function fetchCalendar(days) {
+  const googleStore = createStore(path.join(dataDir, "google.json"), { google: {} });
+  const gcal = createGoogleCalendar({
+    clientId: env.GOOGLE_CLIENT_ID || "",
+    clientSecret: env.GOOGLE_CLIENT_SECRET || "",
+    calendarId: env.GOOGLE_CALENDAR_ID || "primary",
+    store: googleStore,
+  });
+  // Google requires an exact match against a registered redirect URI, so the
+  // env override is the escape hatch when Nova is reached by any name other
+  // than the one the browser is using right now.
+  const googleRedirectUri = (req) => {
+    if (env.GOOGLE_REDIRECT_URI) return env.GOOGLE_REDIRECT_URI;
+    const host = req.headers.host || `localhost:${env.PORT || 3000}`;
+    return `${httpsOptions ? "https" : "http"}://${host}/api/google/callback`;
+  };
+
+  async function fetchIcsEvents(windowStart, windowEnd) {
     if (!icsCache || Date.now() - icsCache.at > ICS_CACHE_MS) {
       const resp = await fetch(ICS_URL, { signal: AbortSignal.timeout(8000) });
       if (!resp.ok) throw new Error(`Calendar feed returned HTTP ${resp.status}`);
       icsCache = { at: Date.now(), text: await resp.text() };
     }
-    const now = Date.now();
-    const { events, unsupported } = expandEvents(
-      parseIcs(icsCache.text),
-      now - 60 * 60 * 1000,
-      now + days * 24 * 60 * 60 * 1000
-    );
+    const { events, unsupported } = expandEvents(parseIcs(icsCache.text), windowStart, windowEnd);
     return {
-      events: events.slice(0, 15).map(e => ({
+      unsupported,
+      events: events.map(e => ({
+        id: "",
         summary: e.summary,
         start_iso: new Date(e.start).toISOString(),
         end_iso: new Date(e.end).toISOString(),
         all_day: e.allDay,
+        source: "ics",
       })),
-      ...(unsupported ? { note: "some repeating events couldn't be read" } : {}),
     };
+  }
+
+  async function fetchCalendar(days) {
+    const now = Date.now();
+    const windowStart = now - 60 * 60 * 1000;
+    const windowEnd = now + days * 24 * 60 * 60 * 1000;
+    const notes = [];
+    let events = [];
+
+    if (gcal.connected()) {
+      // A dead Google connection must not black out a working ICS feed.
+      try {
+        events = await gcal.listEvents({ timeMin: windowStart, timeMax: windowEnd, maxResults: 25 });
+      } catch (err) {
+        if (!ICS_URL) throw err;
+        notes.push("Google Calendar couldn't be reached");
+      }
+    }
+    if (ICS_URL) {
+      try {
+        const ics = await fetchIcsEvents(windowStart, windowEnd);
+        // The common setup points ICS_URL at the very calendar Google is
+        // already serving, so the same event arrives twice. Same title at the
+        // same minute is one event.
+        const seen = new Set(events.map(e => `${e.summary}|${e.start_iso.slice(0, 16)}`));
+        for (const e of ics.events) {
+          if (seen.has(`${e.summary}|${e.start_iso.slice(0, 16)}`)) continue;
+          events.push(e);
+        }
+        if (ics.unsupported) notes.push("some repeating events couldn't be read");
+      } catch (err) {
+        if (!events.length) throw err;
+        notes.push("the subscribed feed couldn't be reached");
+      }
+    }
+
+    events.sort((a, b) => a.start_iso.localeCompare(b.start_iso));
+    return {
+      events: events.slice(0, 15),
+      writable: gcal.connected(),
+      ...(notes.length ? { note: notes.join("; ") } : {}),
+    };
+  }
+
+  // Shared by the three write endpoints: they differ only in what they do with
+  // a validated draft, and all three answer with the same failure vocabulary.
+  function calendarWriteGuard(res) {
+    if (!gcal.configured) {
+      res.writeHead(501, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Google Calendar isn't configured on this server." }));
+      return false;
+    }
+    if (!gcal.connected()) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Google Calendar isn't connected yet.", needs_connect: true }));
+      return false;
+    }
+    return true;
+  }
+
+  function calendarWriteFailed(res, err) {
+    const status = err instanceof GoogleCalendarError ? err.status || 502 : 502;
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      error: String(err?.message || err),
+      ...(err?.needsReconnect ? { needs_connect: true } : {}),
+    }));
   }
 
   // Internet radio. Names flow to the client via /api/config; stream URLs
@@ -737,7 +853,11 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           homeAssistant: HA_ENABLED,
-          calendar: Boolean(ICS_URL),
+          calendar: Boolean(ICS_URL) || gcal.connected(),
+          // Whether Nova may *create* events, and whether there is a connect
+          // flow worth offering. The refresh token itself never appears here.
+          calendarWritable: gcal.connected(),
+          googleConfigured: gcal.configured,
           radio: Object.keys(radioStreams).map(name => ({ name })),
         }));
         return;
@@ -814,7 +934,7 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
       }
 
       if (req.method === "GET" && req.url.split("?")[0] === "/api/calendar") {
-        if (!ICS_URL) { res.writeHead(404); res.end(); return; }
+        if (!ICS_URL && !gcal.connected()) { res.writeHead(404); res.end(); return; }
         const days = Math.min(7, Math.max(1,
           parseInt(new URL(req.url, "http://x").searchParams.get("days"), 10) || 1));
         try {
@@ -825,6 +945,191 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
           res.writeHead(502, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: String(err.message || err) }));
         }
+        return;
+      }
+
+      // ---- Calendar writes. Google only; see the fetchCalendar comment. ----
+
+      if (req.url.split("?")[0] === "/api/calendar/events") {
+        if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
+        if (!calendarWriteGuard(res)) return;
+        noteActivity();
+        let draft;
+        try { draft = JSON.parse(await readBody(req)); } catch { draft = null; }
+        const timeZone = isValidTimeZone(draft?.timezone)
+          ? draft.timezone
+          : Intl.DateTimeFormat().resolvedOptions().timeZone;
+        const { event, error } = buildEventResource(draft || {}, { timeZone });
+        if (error) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error }));
+          return;
+        }
+        try {
+          const created = await gcal.createEvent(event);
+          // Same rationale as the Home Assistant call above: a real, durable
+          // change to something outside Nova gets a row whichever device asked.
+          archive({
+            kind: "calendar",
+            name: created.summary,
+            args: { action: "create", start: created.start_iso },
+            ok: true,
+            summary: `calendar event created: ${created.summary}`,
+          }).catch(() => {});
+          res.writeHead(201, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, event: created }));
+        } catch (err) {
+          calendarWriteFailed(res, err);
+        }
+        return;
+      }
+
+      if (req.url.split("?")[0].startsWith("/api/calendar/events/")) {
+        const id = decodeURIComponent(req.url.split("?")[0].slice("/api/calendar/events/".length));
+        if (!id) { res.writeHead(404); res.end(); return; }
+        if (req.method !== "PATCH" && req.method !== "DELETE") { res.writeHead(405); res.end(); return; }
+        if (!calendarWriteGuard(res)) return;
+        noteActivity();
+
+        if (req.method === "DELETE") {
+          try {
+            // Read first so the archive row and the spoken confirmation can
+            // name what was cancelled rather than an opaque id.
+            let summary = "";
+            try { summary = (await gcal.getEvent(id))?.summary || ""; } catch {}
+            await gcal.deleteEvent(id);
+            archive({
+              kind: "calendar",
+              name: summary || id,
+              args: { action: "cancel" },
+              ok: true,
+              summary: `calendar event cancelled: ${summary || id}`,
+            }).catch(() => {});
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, summary }));
+          } catch (err) {
+            calendarWriteFailed(res, err);
+          }
+          return;
+        }
+
+        let patch;
+        try { patch = JSON.parse(await readBody(req)); } catch { patch = null; }
+        if (!patch || typeof patch !== "object") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Bad event patch." }));
+          return;
+        }
+        const timeZone = isValidTimeZone(patch.timezone)
+          ? patch.timezone
+          : Intl.DateTimeFormat().resolvedOptions().timeZone;
+        try {
+          // A patch may change only the title, only the time, or both. Times
+          // are validated as a pair, so re-running the full builder against
+          // the merged before/after state is what keeps "move it an hour
+          // later" from producing an event that ends before it starts.
+          const current = await gcal.getEvent(id);
+          if (!current) { res.writeHead(404); res.end(); return; }
+          const local = (iso, allDay) => isoToLocal(iso, timeZone, { dateOnly: allDay });
+          const allDay = patch.all_day === undefined ? current.all_day : Boolean(patch.all_day);
+          // Moving an event keeps its length. "Move the standup to four"
+          // says nothing about duration, and defaulting to an hour would
+          // quietly stretch a fifteen-minute meeting.
+          const heldDuration = Math.max(
+            1, Math.round((new Date(current.end_iso) - new Date(current.start_iso)) / 60000)
+          );
+          const movedTimed = Boolean(patch.start) && !allDay;
+          const merged = {
+            summary: patch.summary ?? current.summary,
+            location: patch.location ?? current.location,
+            description: patch.description,
+            all_day: allDay,
+            start: patch.start ?? local(current.start_iso, allDay),
+            end: patch.end ?? (patch.start ? undefined : local(current.end_iso, allDay)),
+            ...(patch.duration_minutes !== undefined
+              ? { duration_minutes: patch.duration_minutes }
+              : movedTimed && current.all_day === allDay
+                ? { duration_minutes: heldDuration }
+                : {}),
+          };
+          // The all-day equivalent: a three-day trip moved to a new start day
+          // is still three days.
+          if (allDay && patch.start && !patch.end && current.all_day) {
+            const spanDays = Math.max(1, Math.round(
+              (new Date(current.end_iso) - new Date(current.start_iso)) / 86400000
+            ));
+            // merged.end is the inclusive last day — the builder is what turns
+            // it back into Google's exclusive one.
+            const shifted = new Date(`${patch.start}T00:00:00Z`);
+            shifted.setUTCDate(shifted.getUTCDate() + spanDays - 1);
+            merged.end = shifted.toISOString().slice(0, 10);
+          }
+          const { event, error } = buildEventResource(merged, { timeZone });
+          if (error) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error }));
+            return;
+          }
+          const updated = await gcal.updateEvent(id, event);
+          archive({
+            kind: "calendar",
+            name: updated.summary,
+            args: { action: "update", start: updated.start_iso },
+            ok: true,
+            summary: `calendar event moved: ${updated.summary}`,
+          }).catch(() => {});
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, event: updated }));
+        } catch (err) {
+          calendarWriteFailed(res, err);
+        }
+        return;
+      }
+
+      // ---- Google OAuth. Browser-facing, not called by the model. ----
+
+      if (req.method === "GET" && req.url.split("?")[0] === "/api/google/auth") {
+        if (!gcal.configured) {
+          res.writeHead(501, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env first.");
+          return;
+        }
+        res.writeHead(302, { Location: gcal.beginAuth(googleRedirectUri(req)) });
+        res.end();
+        return;
+      }
+
+      if (req.method === "GET" && req.url.split("?")[0] === "/api/google/callback") {
+        const params = new URL(req.url, "http://x").searchParams;
+        const page = (title, detail) =>
+          `<!doctype html><meta charset="utf-8"><title>Nova — ${title}</title>` +
+          `<body style="font:16px system-ui;background:#0a0e14;color:#e6edf3;padding:3rem">` +
+          `<h1 style="color:#00d4ff">${title}</h1><p>${detail}</p>` +
+          `<p><a style="color:#00d4ff" href="/">Back to Nova</a></p>`;
+        const fail = (detail) => {
+          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(page("Couldn&rsquo;t connect", detail));
+        };
+        if (params.get("error")) return void fail("Google reported: " + escapeHtml(params.get("error")));
+        if (!gcal.checkState(params.get("state"))) {
+          return void fail("That sign-in link was stale or unexpected. Start again from Nova.");
+        }
+        const code = params.get("code");
+        if (!code) return void fail("Google didn&rsquo;t send an authorization code.");
+        try {
+          await gcal.connect(code, googleRedirectUri(req));
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(page("Calendar connected", "Nova can now read and create events on your Google Calendar."));
+        } catch (err) {
+          fail(escapeHtml(String(err?.message || err)));
+        }
+        return;
+      }
+
+      if (req.method === "POST" && req.url.split("?")[0] === "/api/google/disconnect") {
+        await gcal.disconnect();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
         return;
       }
 
@@ -943,6 +1248,8 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
     // The volume measurement plans/10 "Before you start" B asks for, reported
     // rather than left to someone remembering to look.
     archive: archiveStats(archiveDir),
+    googleConfigured: gcal.configured,
+    googleConnected: gcal.connected(),
   };
   // Tier D runs on a timer measured in hours, and archive writes complete
   // after the response that triggered them; tests and any future manual
@@ -961,7 +1268,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try {
     const server = createNovaServer();
     server.listen(PORT, () => {
-      const { model, voice, https: tls, hasKey, archive } = server.novaInfo;
+      const { model, voice, https: tls, hasKey, archive, googleConfigured, googleConnected } = server.novaInfo;
       const proto = tls ? "https" : "http";
       console.log(`\n  Nova voice assistant`);
       console.log(`  → ${proto}://localhost:${PORT}`);
@@ -977,6 +1284,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       if (archive.length) {
         const kb = Math.round(archive.reduce((sum, m) => sum + m.bytes, 0) / 1024);
         console.log(`  memory: archive ${archive.length} month(s), ${kb} KB`);
+      }
+      if (googleConfigured && !googleConnected) {
+        console.log(`  calendar: open ${proto}://localhost:${PORT}/api/google/auth to connect Google Calendar`);
+      } else if (googleConnected) {
+        console.log(`  calendar: Google connected (read/write)`);
       }
       if (!hasKey) {
         console.warn(`\n  ⚠  OPENAI_API_KEY not set — copy .env.example to .env and add your key.\n`);
