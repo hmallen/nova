@@ -230,6 +230,33 @@ h2 {
   margin-left: 6px;
 }
 
+/* habit suggestions — proposed, not in effect (Plan 10) */
+.suggestion {
+  border-top: 1px solid #263349;
+  padding-top: 10px;
+  margin-top: 10px;
+}
+.suggestion:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
+
+.suggestion-text { color: #c5d0de; font-size: 14px; line-height: 1.45; }
+
+.suggestion-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 9px;
+}
+
+.suggestion-support {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  margin-right: auto;
+}
+
+.suggestion-actions button:disabled { cursor: progress; opacity: 0.5; }
+
 .list-name { color: var(--text); font-weight: 600; font-size: 13px; margin: 8px 0 2px; text-transform: capitalize; }
 .list-items li { color: #c5d0de; padding: 2px 0; }
 .list-items li::before { content: "• "; color: var(--cyan-dim); }

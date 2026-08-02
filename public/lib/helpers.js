@@ -45,3 +45,91 @@ export function normalizePinnedDeviceKeys(value) {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.filter(key => typeof key === "string" && key.trim()).map(key => key.trim()))];
 }
+
+// ---- Memory archive (Plan 10, Tier C) ----
+
+// A past instant the way a person would say it out loud. Recall results are
+// read aloud, so the model never sees an ISO string — same treatment
+// get_calendar gives event times.
+export function spokenPastTime(iso, now = Date.now()) {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return "at some point";
+  const today = new Date(now);
+  const midnight = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((midnight(today) - midnight(at)) / 86400000);
+  const time = at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (days === 0) return `today at ${time}`;
+  if (days === 1) return `yesterday at ${time}`;
+  if (days > 1 && days < 7) return `${at.toLocaleDateString([], { weekday: "long" })} at ${time}`;
+  return at.toLocaleDateString([], { month: "long", day: "numeric" });
+}
+
+// Tools that pull in text Nova doesn't control. Rows they produce are marked
+// source "external" and stay out of recall results by default. Pairs with
+// UNTRUSTED_TOOLS in lib/memory.js, which does the same job for the rollover.
+export const EXTERNAL_TOOLS = ["get_news"];
+
+// Recall shouldn't archive the act of recalling: a row per lookup would grow
+// the file every time the model reads it and match every later query about
+// the same subject.
+export const ARCHIVE_SKIP_TOOLS = ["recall_memory"];
+
+// The argument fields worth querying later, per tool. Everything else is
+// dropped before the row is written — not only for size: retrieval quality
+// degrades sharply when one record mixes topics, so a focused row beats a
+// complete one. Tools absent from this map archive with no arguments at all.
+const ARCHIVE_ARG_FIELDS = {
+  get_weather: ["location"],
+  manage_list: ["action", "list", "item"],
+  control_device: ["device", "action", "value"],
+  set_timer: ["label", "minutes"],
+  start_stopwatch: ["label"],
+  set_alarm: ["time", "label"],
+  set_reminder: ["text", "datetime"],
+  snooze: ["minutes"],
+  cancel_timer_or_alarm: ["label"],
+  get_news: ["topic"],
+  play_ambient_sound: ["sound"],
+  run_routine: ["name"],
+  manage_routine: ["action", "name", "step_tool"],
+  get_calendar: ["days"],
+  set_volume: ["level", "direction"],
+  // Deliberately action-only. What was remembered is already a fact in
+  // memory.json; copying the text into an append-only log would put the most
+  // sensitive thing the user ever says somewhere "forget that" can't reach.
+  manage_preferences: ["action"],
+  remember: ["action"],
+};
+
+export function redactArgs(name, args = {}) {
+  const fields = ARCHIVE_ARG_FIELDS[name];
+  if (!fields || !args || typeof args !== "object") return {};
+  const out = {};
+  for (const field of fields) {
+    const value = args[field];
+    const kind = typeof value;
+    if (kind === "string" ? value.trim() : kind === "number" || kind === "boolean") {
+      out[field] = kind === "string" ? value.trim() : value;
+    }
+  }
+  return out;
+}
+
+// One short line a person could read back. Only scalars survive, which is also
+// what keeps fetched third-party text — news headlines arrive as objects —
+// from ever reaching the summary.
+export function summarizeToolResult(output) {
+  if (!output || typeof output !== "object") return "";
+  if (output.error) return String(output.error).slice(0, 200);
+  const parts = [];
+  for (const [key, value] of Object.entries(output)) {
+    if (parts.length >= 4) break;
+    if (key === "ok") continue;
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      parts.push(`${key}: ${value}`);
+    } else if (Array.isArray(value) && value.every(v => typeof v === "string") && value.length) {
+      parts.push(`${key}: ${value.slice(0, 5).join(", ")}`);
+    }
+  }
+  return parts.join(", ").slice(0, 200);
+}

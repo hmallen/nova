@@ -43,6 +43,13 @@ Try:
   "Forget that" — open-ended facts, shared across every device in the house
 - "What did I just ask you?" — after a dropped connection or a page reload,
   Nova picks the conversation back up instead of starting cold
+- "What was on my shopping list last week?" · "When did I last turn on the
+  porch light?" — an on-demand archive of what actually happened. If there's
+  no record, Nova says so rather than guessing
+- "Good morning" — after a couple of weeks, the update may end with "by the
+  way, you ask for the weather most mornings around 7 — want me to just
+  include it?" Say yes and it's remembered; anything Nova notices also shows
+  up on a card, and nothing is remembered until you agree to it
 - "Change your voice to cedar" — takes effect on the next session
 - "Tell me a joke" · "How many ounces in a cup?" — answered directly by the model
 
@@ -122,6 +129,26 @@ Browser ──(mic audio via WebRTC)──────────► OpenAI Rea
   `ROLLOVER_MAX_AGE_MIN` minutes (default 30) come back, and turns that read
   news headlines are dropped so third-party text can't ride forward into the
   next session's context.
+- **The archive** is an append-only log of what happened — one JSONL file per
+  month under `data/archive/`, written by the client for every tool call and
+  turn, and by the server for list edits and Home Assistant calls so a change
+  made on another device is captured too. It is read *only* when the model
+  calls `recall_memory`, so it never enters the prompt and costs nothing on a
+  normal turn no matter how large it grows. A lookup that finds nothing returns
+  an explicit "no record" rather than an empty result, because the failure mode
+  otherwise is a confident, invented answer about your own past. News rows are
+  archived but excluded from recall.
+- **Learned habits** are counted from the archive every `HABIT_SCAN_INTERVAL_H`
+  hours (default 6) while nobody is talking — time-of-day patterns, repeated
+  arguments, weekly purchases, device routines — with no model involved
+  anywhere: it is deterministic counting, which is faster, cheaper, and better
+  at arithmetic than asking an LLM to spot a pattern. Every rule needs distinct
+  *days* or *weeks*, so one long Saturday of fiddling with the lights doesn't
+  manufacture a habit. Nothing is ever written to memory automatically: a
+  pattern becomes a suggestion on the "Nova noticed" card, Nova raises it once
+  at the end of a routine you asked for, and only an explicit yes promotes it
+  to a fact — marked `derived` forever, and retired automatically if the habit
+  stops.
 
 ## Real integrations (all optional, env-gated)
 
@@ -287,11 +314,25 @@ Sources:
   should ring on the kitchen tablet, and cross-device ringing would need push.
 - Preferences (name, home city, units, voice) are a single per-browser profile —
   multiple people sharing one browser share one set of preferences.
-- Remembered facts and conversation rollover are one shared household memory,
-  stored server-side with no auth — the same LAN trust level as lists. Ask on
-  the kitchen tablet and follow up on your phone and it carries; there is no
-  per-person scoping yet, so everyone in the house sees everyone's facts.
-  Nothing is remembered unless you ask for it, and nothing is summarized by a
-  model on the way in — facts and turns are stored as text, verbatim.
+- Remembered facts, conversation rollover, and the archive are one shared
+  household memory, stored server-side with no auth — the same LAN trust level
+  as lists. Ask on the kitchen tablet and follow up on your phone and it
+  carries; there is no per-person scoping yet, so everyone in the house sees
+  everyone's facts and everyone's history. Nothing is summarized by a model on
+  the way in — facts, turns, and events are stored as text, verbatim.
+- The archive records everything that happens, not only what you ask to be
+  remembered. Structured events (tool calls, list edits, device changes) are
+  kept indefinitely — a year is a few megabytes; conversation turns expire
+  after `ARCHIVE_TURN_RETENTION_DAYS` (default 90), since they're bulkier,
+  less useful to look up, and the higher-sensitivity content in an
+  always-listening device. Set it to `0` to keep turns forever. It's a plain
+  directory of JSONL files: `rm data/archive/2026-07.jsonl` is a valid way to
+  forget a month.
+- Habits are counted in the server's local timezone, which is the household's
+  by construction — Nova is meant to run on the LAN, in the house.
+- Recall is a case-insensitive scan across month files. That is fine into the
+  low thousands of rows a month and will get slow past roughly 50k, at which
+  point the server says so in the log; the fix is a keyword index, which costs
+  a native dependency this project doesn't have yet.
 - Realtime audio is billed per audio token; use `REALTIME_MODEL=gpt-realtime-2.1-mini`
   in `.env` for cheaper experimentation.
