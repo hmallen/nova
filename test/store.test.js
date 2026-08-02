@@ -14,7 +14,7 @@ test("fresh store starts at rev 0; rev bumps per write and persists", async () =
   const file = tmpFile();
   const store = createStore(file);
   assert.deepEqual(store.get(), { lists: {}, rev: 0 });
-  await store.update(() => ({ shopping: ["milk"] }));
+  await store.update(() => ({ lists: { shopping: ["milk"] } }));
   assert.equal(store.get().rev, 1);
   // A second instance reads the same state back off disk.
   const reloaded = createStore(file);
@@ -24,7 +24,7 @@ test("fresh store starts at rev 0; rev bumps per write and persists", async () =
 test("atomic write leaves no .tmp residue", async () => {
   const file = tmpFile();
   const store = createStore(file);
-  await store.update(() => ({ "to-do": ["a", "b"] }));
+  await store.update(() => ({ lists: { "to-do": ["a", "b"] } }));
   assert.ok(fs.existsSync(file));
   assert.ok(!fs.existsSync(file + ".tmp"));
 });
@@ -51,11 +51,40 @@ test("concurrent update() calls serialize (no lost writes)", async () => {
   const store = createStore(file);
   await Promise.all(
     [...Array(10)].map((_, i) =>
-      store.update(cur => ({ ...cur.lists, ["list" + i]: [String(i)] }))
+      store.update(cur => ({ lists: { ...cur.lists, ["list" + i]: [String(i)] } }))
     )
   );
   assert.equal(store.get().rev, 10);
   assert.equal(Object.keys(store.get().lists).length, 10);
   // On-disk copy matches the final in-memory state.
   assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), store.get());
+});
+
+test("a custom defaults shape round-trips, and unknown keys are ignored", async () => {
+  const file = tmpFile();
+  const store = createStore(file, { facts: [], rollover: null });
+  assert.deepEqual(store.get(), { facts: [], rollover: null, rev: 0 });
+
+  await store.update(cur => ({ ...cur, facts: [{ id: "f_1", text: "cat is Widget" }] }));
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), sneaky: true }));
+
+  const reloaded = createStore(file, { facts: [], rollover: null });
+  assert.equal(reloaded.get().facts[0].text, "cat is Widget");
+  assert.equal(reloaded.get().rev, 1);
+  assert.ok(!("sneaky" in reloaded.get()));
+});
+
+test("a persisted value of the wrong kind falls back to its default", () => {
+  const file = tmpFile();
+  fs.writeFileSync(file, JSON.stringify({ facts: "not an array", rollover: null, rev: 4 }));
+  const store = createStore(file, { facts: [], rollover: null });
+  assert.deepEqual(store.get(), { facts: [], rollover: null, rev: 4 });
+});
+
+test("defaults are not shared between store instances", async () => {
+  const defaults = { facts: [], rollover: null };
+  const a = createStore(tmpFile(), defaults);
+  await a.update(cur => ({ ...cur, facts: [{ id: "f_1", text: "x" }] }));
+  assert.deepEqual(createStore(tmpFile(), defaults).get().facts, []);
+  assert.deepEqual(defaults.facts, []);
 });

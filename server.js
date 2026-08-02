@@ -23,6 +23,34 @@ import { parseRss } from "./lib/rss.js";
 import { parseIcs, expandEvents } from "./lib/ics.js";
 import { parseEnv, applyEnv } from "./lib/env.js";
 import { sanitizePrefs, buildAboutBlock } from "./lib/prefs.js";
+import {
+  addFact,
+  forgetFact,
+  activeFacts,
+  factsForPrompt,
+  sanitizeRollover,
+  rolloverForSession,
+  renderRolloverText,
+  mergeSuggestions,
+  pendingSuggestions,
+  acceptSuggestion,
+  dismissSuggestion,
+  askSuggestion,
+  setFactStale,
+  DEFAULT_ROLLOVER_MAX_AGE_MIN,
+} from "./lib/memory.js";
+import {
+  sanitizeEvent,
+  appendEvents,
+  scanArchive,
+  readRange,
+  sweepArchive,
+  archiveStats,
+  MAX_BATCH_EVENTS,
+  RECALL_LIMIT,
+  DEFAULT_TURN_RETENTION_DAYS,
+} from "./lib/archive.js";
+import { detectHabits, measureHabit, isDecayed } from "./lib/habits.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -105,10 +133,30 @@ If the user tells you something to remember about themselves (their name, home
 city, temperature units, or which voice to use), call manage_preferences to
 save it — don't just acknowledge.
 
+If they ask you to remember anything else — an allergy, a family member, a
+habit — call remember to save it; don't just say you will. If they tell you
+something that contradicts a fact you were given, save the new one with the
+"replaces" field set to the old fact's id. Memory ids are for your use only:
+never say one out loud.
+
+Use recall_memory only when the user asks about the PAST — what was on a list
+on an earlier day, when a device was last changed, what you talked about days
+ago — and you don't already know the answer. Never use it for current state;
+the normal skill for that is always right and always faster. If recall_memory
+comes back with found false, say plainly that you have no record of it. Never
+guess at what happened, and never infer a past event from what is true now.
+
 When the user greets you with "good morning" or "good night", call run_routine
 with that name if it exists. Present routine results as one connected update,
 not a list of tool outputs: weather first, then today's schedule, then a few
 headlines. Keep the whole update under about thirty seconds of speech.
+
+If a routine result includes a "suggestion", mention it once at the very end of
+that update, as one short friendly question — never in the middle, never more
+than one, and never anywhere except after a routine. If the user says yes, call
+remember with action "accept" and that suggestion's id. If they say no, call it
+with action "dismiss". If they ignore it or change the subject, let it go
+without asking again.
 `.trim();
 
 // Read a small JSON request body (session prefs, list sync, HA calls).
@@ -164,6 +212,173 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
 
   mkdirSync(dataDir, { recursive: true });
   const store = createStore(path.join(dataDir, "state.json"));
+  // Memory gets its own file (Plan 9): separate blast radius, separate backup,
+  // and a corrupt memory file can never take the shopping list down with it.
+  const memory = createStore(path.join(dataDir, "memory.json"), {
+    facts: [],
+    rollover: null,
+    // Tier D (Plan 10). Timestamps default to "" rather than null: createStore
+    // discards a stored value whose broad kind doesn't match its default, and
+    // typeof null is "object".
+    suggestions: [],
+    lastScanAt: "",
+    lastSweepAt: "",
+  });
+  // Tier C's archive is a directory of month files, not a store — append-only,
+  // never read on a normal turn. See lib/archive.js.
+  const archiveDir = path.join(dataDir, "archive");
+
+  const num = (raw, fallback, floor = 0) => {
+    const value = Number(String(raw ?? "").trim());
+    return String(raw ?? "").trim() && Number.isFinite(value) && value >= floor ? value : fallback;
+  };
+  // How long a finished conversation stays replayable. 0 turns rollover off.
+  const ROLLOVER_MAX_AGE_MIN = num(env.ROLLOVER_MAX_AGE_MIN, DEFAULT_ROLLOVER_MAX_AGE_MIN);
+  // Conversation turns expire; structured events don't. 0 keeps turns forever.
+  const TURN_RETENTION_DAYS = num(env.ARCHIVE_TURN_RETENTION_DAYS, DEFAULT_TURN_RETENTION_DAYS);
+  // Habit scan cadence. 0 turns Tier D off entirely.
+  const HABIT_SCAN_INTERVAL_H = num(env.HABIT_SCAN_INTERVAL_H, 6);
+
+  // ---- Memory archive (Plan 10, Tier C) ----
+
+  // Last sign of a live session. The habit pass reads month files, and there
+  // is no reason to do that while someone is talking.
+  let lastActivityAt = 0;
+  const SESSION_QUIET_MS = 2 * 60 * 1000;
+  const noteActivity = () => { lastActivityAt = Date.now(); };
+
+  // Fire-and-forget in every caller: capture must degrade, never break the
+  // voice path. Sanitization is authoritative here rather than in the browser,
+  // for the same reason the rollover's is — the client is untrusted input even
+  // when it's ours.
+  //
+  // Writes are serialized through a promise chain, like createStore's: two
+  // appends racing on the same month file have no ordering guarantee, and an
+  // append-only log with interleaved lines is a log with a hole in it.
+  let archiveWrites = Promise.resolve(0);
+  function archive(events) {
+    const rows = (Array.isArray(events) ? events : [events])
+      .slice(0, MAX_BATCH_EVENTS)
+      .map(event => sanitizeEvent(event))
+      .filter(Boolean);
+    if (!rows.length) return archiveWrites.then(() => 0);
+    archiveWrites = archiveWrites
+      .then(() => appendEvents(archiveDir, rows))
+      .catch((err) => {
+        console.warn(`  ⚠  archive: couldn't write ${rows.length} event(s) — ${err.message || err}`);
+        return 0;
+      });
+    return archiveWrites;
+  }
+
+  // A list PUT carries the whole map, not the edit. Diffing is what turns
+  // "another device saved a different shopping list" into "oat milk was added"
+  // — the row Tier D's recurring-purchase rule counts, and the only capture
+  // path for a device that isn't the one running the session.
+  function diffLists(before = {}, after = {}) {
+    const events = [];
+    const counts = (items = []) => {
+      const map = new Map();
+      for (const item of items) map.set(item, (map.get(item) || 0) + 1);
+      return map;
+    };
+    for (const list of new Set([...Object.keys(before), ...Object.keys(after)])) {
+      const was = counts(before[list]);
+      const now = counts(after[list]);
+      for (const [item, n] of now) {
+        for (let i = 0; i < n - (was.get(item) || 0); i++) {
+          events.push({ kind: "list", name: list, args: { action: "add", list, item },
+            summary: `added ${item} to ${list}` });
+        }
+      }
+      for (const [item, n] of was) {
+        for (let i = 0; i < n - (now.get(item) || 0); i++) {
+          events.push({ kind: "list", name: list, args: { action: "remove", list, item },
+            summary: `removed ${item} from ${list}` });
+        }
+      }
+    }
+    return events.slice(0, MAX_BATCH_EVENTS);
+  }
+
+  // ---- Learned habits (Plan 10, Tier D) ----
+
+  // Long enough for the widest rule (recurring purchases, six weeks).
+  const HABIT_WINDOW_DAYS = 42;
+
+  async function runHabitScan({ now = Date.now(), force = false } = {}) {
+    if (!force && now - lastActivityAt < SESSION_QUIET_MS) return null;
+    let rows;
+    try {
+      rows = await readRange(archiveDir, new Date(now - HABIT_WINDOW_DAYS * 86400000).toISOString(), null);
+    } catch {
+      return null; // no archive yet, or unreadable — nothing to notice
+    }
+    const detected = detectHabits(rows, { now });
+    let summary = null;
+    await memory.update((cur) => {
+      const merged = mergeSuggestions(cur.suggestions, detected, { now: () => now });
+      // Decay (§9): habits end. Re-measure the rule behind every accepted
+      // derived fact and retire the ones that have quietly stopped being true.
+      // The fact is kept — a habit resuming should simply restore it.
+      let facts = cur.facts;
+      let retired = 0;
+      let restored = 0;
+      for (const fact of cur.facts) {
+        if (fact.source !== "derived" || !fact.rule || fact.supersededBy) continue;
+        const decayed = isDecayed(fact.rule, measureHabit(fact, rows, { now }));
+        if (decayed !== Boolean(fact.stale)) decayed ? retired++ : restored++;
+        facts = setFactStale(facts, fact.id, decayed);
+      }
+      summary = {
+        proposed: merged.added,
+        pending: pendingSuggestions(merged.suggestions).length,
+        retired,
+        restored,
+      };
+      return {
+        ...cur,
+        facts,
+        suggestions: merged.suggestions,
+        lastScanAt: new Date(now).toISOString(),
+      };
+    });
+    return summary;
+  }
+
+  // Expired turn rows are dropped on the same off-session moment as the scan,
+  // at most once a day — the sweep re-reads old month files, so there is no
+  // point doing it four times.
+  async function runSweep({ now = Date.now() } = {}) {
+    const last = memory.get().lastSweepAt;
+    if (last && now - Date.parse(last) < 24 * 60 * 60 * 1000) return null;
+    let result;
+    try {
+      result = await sweepArchive(archiveDir, { now, turnRetentionDays: TURN_RETENTION_DAYS });
+    } catch {
+      return null;
+    }
+    await memory.update((cur) => ({ ...cur, lastSweepAt: new Date(now).toISOString() }));
+    if (result.removed) {
+      console.log(`  memory: archive sweep dropped ${result.removed} expired turn(s).`);
+    }
+    return result;
+  }
+
+  // A plain setInterval at boot: no cron, no new container, no new dependency.
+  // The due check reads the persisted lastScanAt, so a container restart never
+  // triggers an immediate rescan.
+  let scanTimer = null;
+  if (HABIT_SCAN_INTERVAL_H > 0) {
+    const intervalMs = HABIT_SCAN_INTERVAL_H * 60 * 60 * 1000;
+    scanTimer = setInterval(() => {
+      const last = Date.parse(memory.get().lastScanAt || "");
+      if (Number.isFinite(last) && Date.now() - last < intervalMs) return;
+      runSweep().catch(() => {});
+      runHabitScan().catch(() => {});
+    }, Math.min(intervalMs, 15 * 60 * 1000));
+    scanTimer.unref?.(); // never hold the process open for a habit count
+  }
 
   // ---- News (Plan 4): keyless RSS proxy — browsers can't fetch
   // cross-origin RSS, so the server does, and returns speakable headlines.
@@ -274,12 +489,12 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
   // Session template. Tool definitions live in the client (public/app.js)
   // alongside their implementations and are attached via session.update once
   // the data channel opens.
-  function sessionConfig(prefs = {}) {
+  function sessionConfig(prefs = {}, facts = []) {
     return {
       session: {
         type: "realtime",
         model: REALTIME_MODEL,
-        instructions: INSTRUCTIONS + buildAboutBlock(prefs),
+        instructions: INSTRUCTIONS + buildAboutBlock(prefs, facts),
         audio: {
           output: { voice: prefs.voice || VOICE },
         },
@@ -287,14 +502,14 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
     };
   }
 
-  async function mintClientSecret(prefs) {
+  async function mintClientSecret(prefs, facts) {
     const resp = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(sessionConfig(prefs)),
+      body: JSON.stringify(sessionConfig(prefs, facts)),
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -307,6 +522,7 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
   const requestHandler = async (req, res) => {
     try {
       if (req.method === "POST" && req.url === "/api/session") {
+        noteActivity();
         if (!OPENAI_API_KEY) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "OPENAI_API_KEY is not set. Copy .env.example to .env and add your key." }));
@@ -317,15 +533,203 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
           const body = await readBody(req);
           prefs = sanitizePrefs(body ? JSON.parse(body).prefs : null);
         } catch {} // absent/invalid body → default session
+        // Remembered facts (Plan 9) live server-side and are never posted from
+        // the browser — that keeps them shared across devices and removes a
+        // whole class of injection at the same time.
+        const mem = memory.get();
+        const { facts, dropped } = factsForPrompt(mem.facts);
+        if (dropped) {
+          console.warn(`  ⚠  memory: ${dropped} fact(s) left out of the prompt (over the size cap).`);
+        }
         try {
-          const secret = await mintClientSecret(prefs);
+          const secret = await mintClientSecret(prefs, facts);
+          const rollover = rolloverForSession(mem.rollover, { maxAgeMin: ROLLOVER_MAX_AGE_MIN });
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ value: secret.value, model: REALTIME_MODEL }));
+          res.end(JSON.stringify({
+            value: secret.value,
+            model: REALTIME_MODEL,
+            // Rides back on the response the client already waits for, so
+            // rehydration costs no extra round trip on the startup path.
+            rollover: rollover ? { text: renderRolloverText(rollover.turns) } : null,
+          }));
         } catch (err) {
           res.writeHead(502, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: String(err.message || err) }));
         }
         return;
+      }
+
+      // ---- Memory (Plan 9). Same LAN trust level as the lists above. ----
+      if (req.url.split("?")[0] === "/api/memory/facts") {
+        // Only id and text go back to the client: tool results are read aloud,
+        // so they stay small and speakable.
+        const speakable = (f) => ({ id: f.id, text: f.text });
+        if (req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ facts: activeFacts(memory.get().facts).map(speakable) }));
+          return;
+        }
+        if (req.method === "POST") {
+          let body;
+          try { body = JSON.parse(await readBody(req)); } catch { body = null; }
+          let result = { error: "Unknown action." };
+          if (body?.action === "add" || body?.action === "forget") {
+            await memory.update((cur) => {
+              result = body.action === "add"
+                ? addFact(cur.facts, { text: body.text, replaces: body.replaces, source: "speech" })
+                : forgetFact(cur.facts, body.id);
+              if (result.error) return null; // no write, no rev bump
+              return { ...cur, facts: result.facts };
+            });
+          }
+          if (result.error) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: result.error }));
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result.fact
+            ? { ok: true, fact: speakable(result.fact) }
+            : { ok: true, forgot: speakable(result.forgotten) }));
+          return;
+        }
+        res.writeHead(405); res.end(); return;
+      }
+
+      // ---- Memory archive (Plan 10). ----
+
+      // Batched capture from the client. POST-only because sendBeacon can't do
+      // anything else, and the pagehide flush is what makes an unclean drop
+      // cost seconds of history rather than a session of it.
+      if (req.url.split("?")[0] === "/api/memory/archive") {
+        if (req.method === "POST") {
+          noteActivity();
+          let body;
+          try { body = JSON.parse(await readBody(req)); } catch { body = null; }
+          const stored = await archive(body?.events || []);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, stored }));
+          return;
+        }
+        res.writeHead(405); res.end(); return;
+      }
+
+      // The recall read path. POST, not GET with a query string: the query is
+      // household conversation content and has no business in a URL or an
+      // access log.
+      if (req.url.split("?")[0] === "/api/memory/recall") {
+        if (req.method === "POST") {
+          noteActivity();
+          let body;
+          try { body = JSON.parse(await readBody(req)); } catch { body = null; }
+          const query = String(body?.query || "").slice(0, 200);
+          if (!query.trim()) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "A query is required." }));
+            return;
+          }
+          let result;
+          try {
+            result = await scanArchive(archiveDir, {
+              query,
+              kind: body?.kind,
+              since: body?.since,
+              until: body?.until,
+              limit: RECALL_LIMIT,
+            });
+          } catch {
+            // A missing or unreadable archive is an honest "no record", not an
+            // error the model has to interpret.
+            result = { found: false, events: [], scanned: 0, oversized: 0 };
+          }
+          // Logged from day one with its arguments: the cost argument for Tier
+          // C rests on this being called rarely, and that can't be tuned
+          // without knowing what triggered it (plans/10 "Before you start" A).
+          console.log(`  memory: recall ${JSON.stringify({ query, kind: body?.kind, since: body?.since, until: body?.until })}` +
+            ` → ${result.events.length} of ${result.scanned} row(s)`);
+          if (result.oversized) {
+            console.warn(`  ⚠  memory: a month file holds ${result.oversized} rows — past the point where ` +
+              `the substring scan is worth replacing with a keyword index (see plans/10 "Deferred").`);
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          // found:false explicitly, never an empty array — an empty list reads
+          // to the model as success, and the failure mode that produces is a
+          // confident, fabricated answer about the household's own past.
+          res.end(JSON.stringify(result.found
+            ? { found: true, events: result.events.map(e => ({ at: e.at, kind: e.kind, name: e.name, summary: e.summary })) }
+            : { found: false }));
+          return;
+        }
+        res.writeHead(405); res.end(); return;
+      }
+
+      // Habit suggestions (Tier D). Accept is the only path from a noticed
+      // pattern into the system prompt, and it is a button, not a scan result.
+      if (req.url.split("?")[0] === "/api/memory/suggestions") {
+        const speakable = (s) => ({ id: s.id, text: s.text, support: s.support });
+        if (req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ suggestions: pendingSuggestions(memory.get().suggestions).map(speakable) }));
+          return;
+        }
+        if (req.method === "POST") {
+          let body;
+          try { body = JSON.parse(await readBody(req)); } catch { body = null; }
+          // "ask" claims the next suggestion for Nova to raise out loud and
+          // stamps it, so she raises it once no matter how many routines run.
+          if (body?.action === "ask") {
+            let claimed = null;
+            await memory.update((cur) => {
+              const result = askSuggestion(cur.suggestions);
+              claimed = result.suggestion;
+              if (!claimed) return null;
+              return { ...cur, suggestions: result.suggestions };
+            });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ suggestion: claimed ? speakable(claimed) : null }));
+            return;
+          }
+          let result = { error: "Unknown action." };
+          if (body?.action === "accept" || body?.action === "dismiss") {
+            await memory.update((cur) => {
+              result = body.action === "accept"
+                ? acceptSuggestion(cur, body.id)
+                : dismissSuggestion(cur.suggestions, body.id);
+              if (result.error) return null; // no write, no rev bump
+              return { ...cur, ...(result.facts ? { facts: result.facts } : {}), suggestions: result.suggestions };
+            });
+          }
+          if (result.error) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: result.error }));
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, ...(result.fact ? { fact: { id: result.fact.id, text: result.fact.text } } : {}) }));
+          return;
+        }
+        res.writeHead(405); res.end(); return;
+      }
+
+      // POST as well as PUT: the client flushes on pagehide via sendBeacon,
+      // which can only POST.
+      if (req.url.split("?")[0] === "/api/memory/rollover") {
+        if (req.method === "PUT" || req.method === "POST") {
+          noteActivity();
+          let body;
+          try { body = JSON.parse(await readBody(req)); } catch { body = null; }
+          const rollover = sanitizeRollover(body);
+          if (!rollover) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Bad rollover payload" }));
+            return;
+          }
+          await memory.update((cur) => ({ ...cur, rollover }));
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        res.writeHead(405); res.end(); return;
       }
 
       // Which optional integrations are live (non-secret config only).
@@ -388,6 +792,18 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
             body: JSON.stringify({ entity_id: call.entity_id, ...(call.data || {}) }),
           });
           if (!resp.ok) throw new Error(`HA returned HTTP ${resp.status}`);
+          // Every real device change is recorded here, whichever device asked
+          // for it — this is the row Tier D's device rule counts.
+          archive({
+            kind: "device",
+            name: call.entity_id,
+            args: {
+              action: call.service === "turn_on" ? "on" : call.service === "turn_off" ? "off" : "set",
+              ...(typeof call.data?.temperature === "number" ? { value: call.data.temperature } : {}),
+            },
+            ok: true,
+            summary: `${call.entity_id} ${call.service.replace(/_/g, " ")}`,
+          }).catch(() => {});
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true }));
         } catch (err) {
@@ -458,9 +874,11 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
           // Rev check runs inside the serialized update chain so two racing
           // PUTs can't both commit against the same rev.
           let conflict = false;
+          let changes = [];
           const next = await store.update((cur) => {
             if (body.rev !== cur.rev) { conflict = true; return null; }
-            return body.lists;
+            changes = diffLists(cur.lists, body.lists);
+            return { ...cur, lists: body.lists };
           });
           if (conflict) {
             // Stale client: hand back current state so it can re-apply on top.
@@ -468,6 +886,9 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
             res.end(JSON.stringify(next));
             return;
           }
+          // Archived here rather than in the client, so an edit made on the
+          // tablet is captured on the box that isn't running the session.
+          archive(changes).catch(() => {});
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ rev: next.rev }));
           return;
@@ -519,7 +940,15 @@ export function createNovaServer({ env = process.env, dataDir = path.join(__dirn
     voice: VOICE,
     https: useHttps,
     hasKey: Boolean(OPENAI_API_KEY),
+    // The volume measurement plans/10 "Before you start" B asks for, reported
+    // rather than left to someone remembering to look.
+    archive: archiveStats(archiveDir),
   };
+  // Tier D runs on a timer measured in hours, and archive writes complete
+  // after the response that triggered them; tests and any future manual
+  // trigger need a way in that doesn't involve waiting for either.
+  server.novaMemory = { runHabitScan, runSweep, settled: () => archiveWrites };
+  server.on("close", () => { if (scanTimer) clearInterval(scanTimer); });
   return server;
 }
 
@@ -532,7 +961,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try {
     const server = createNovaServer();
     server.listen(PORT, () => {
-      const { model, voice, https: tls, hasKey } = server.novaInfo;
+      const { model, voice, https: tls, hasKey, archive } = server.novaInfo;
       const proto = tls ? "https" : "http";
       console.log(`\n  Nova voice assistant`);
       console.log(`  → ${proto}://localhost:${PORT}`);
@@ -545,6 +974,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         }
       }
       console.log(`  model: ${model}, voice: ${voice}`);
+      if (archive.length) {
+        const kb = Math.round(archive.reduce((sum, m) => sum + m.bytes, 0) / 1024);
+        console.log(`  memory: archive ${archive.length} month(s), ${kb} KB`);
+      }
       if (!hasKey) {
         console.warn(`\n  ⚠  OPENAI_API_KEY not set — copy .env.example to .env and add your key.\n`);
       }

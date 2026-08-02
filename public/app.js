@@ -16,6 +16,11 @@ import {
   formatElapsedTime,
   normalizePinnedDeviceKeys,
   routineStepNames,
+  redactArgs,
+  summarizeToolResult,
+  spokenPastTime,
+  EXTERNAL_TOOLS,
+  ARCHIVE_SKIP_TOOLS,
 } from "./lib/helpers.js";
 
 // ---------- DOM ----------
@@ -411,6 +416,45 @@ function buildTools() {
   },
   {
     type: "function",
+    name: "remember",
+    description: "Save, list, or forget an open-ended fact about the household — allergies, " +
+      "family members, habits, anything that doesn't fit a set preference field. Use when the " +
+      "user says 'remember that…', 'don't forget…', 'forget that…'. For their name, home city, " +
+      "temperature units, or your voice, use manage_preferences instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["add", "list", "forget", "accept", "dismiss"] },
+        text: { type: "string", description: "add: the fact in your own words, one short sentence" },
+        replaces: { type: "string", description: "add: id of the fact this one supersedes" },
+        id: { type: "string", description: "forget: id of the fact to forget. accept/dismiss: id of the suggestion" },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    type: "function",
+    name: "recall_memory",
+    // Deliberately narrow. The entire cost argument for the archive is that
+    // this is called rarely — every invocation adds a full model round-trip,
+    // so a tool that fires on ordinary questions would erase the advantage.
+    description: "Look up something that happened in the past — what was on a list on an " +
+      "earlier date, when a device was last changed, what was discussed days ago. Only use " +
+      "this when the user asks about the PAST and you don't already know the answer. Never " +
+      "use it for current state — use the normal skill for that.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What to look for, in the user's own words" },
+        kind: { type: "string", enum: ["tool", "turn", "list", "device"] },
+        since: { type: "string", description: "ISO date, e.g. '2026-07-20'" },
+        until: { type: "string", description: "ISO date" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    type: "function",
     name: "set_volume",
     description: "Set the assistant's speaker volume from 0 (mute) to 10 (max), or adjust up/down.",
     parameters: {
@@ -774,13 +818,20 @@ const toolHandlers = {
         results.push({ step: String(tool), error: "This skill isn't allowed in routines." });
         continue;
       }
+      // Steps run through the handlers directly, so runTool never sees them —
+      // record each one here or the rollover filter would miss a news step.
+      pendingTools.push(tool);
       try {
         results.push({ step: tool, result: await toolHandlers[tool](args) });
       } catch (err) {
         results.push({ step: tool, error: String(err.message || err) });
       }
     }
-    return { routine: key, results };
+    // A habit Nova has noticed rides out on the end of an update the user
+    // already asked for — she never opens a conversation to ask. The card
+    // stays as the record either way, so ignoring the question loses nothing.
+    const suggestion = await claimSuggestionToAsk();
+    return { routine: key, results, ...(suggestion ? { suggestion } : {}) };
   },
 
   async manage_routine({ action, name, step_tool }) {
@@ -872,6 +923,63 @@ const toolHandlers = {
     savePrefs();
     if (!changed) return { prefs: speakable(), note: "nothing changed" };
     return { ok: true, prefs: speakable(), ...(note ? { note } : {}) };
+  },
+
+  // Facts live server-side (Plan 9), unlike preferences: shared across every
+  // device in the house, and never posted from the browser into the prompt.
+  async remember({ action, text, replaces, id }) {
+    const call = async (init) => {
+      let resp;
+      try {
+        resp = await fetch("/api/memory/facts", init);
+      } catch {
+        return { error: "I can't reach my memory right now — nothing was saved." };
+      }
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) return { error: body.error || `Memory is unavailable (HTTP ${resp.status}).` };
+      return body;
+    };
+    if (action === "list") return call({});
+    if (action === "add" || action === "forget") {
+      return call({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, text, replaces, id }),
+      });
+    }
+    // Answering the question Nova asked at the end of a routine. Accepting
+    // goes through the suggestion, not through "add", so the resulting fact
+    // keeps its "derived" provenance and the rule that lets it expire later.
+    if (action === "accept" || action === "dismiss") {
+      const result = await resolveSuggestion(id, action);
+      if (result.ok) pollSuggestions();
+      return result;
+    }
+    return { error: "Unknown action." };
+  },
+
+  async recall_memory({ query, kind, since, until }) {
+    let body;
+    try {
+      const resp = await fetch("/api/memory/recall", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, kind, since, until }),
+      });
+      body = await resp.json();
+      if (!resp.ok) return { error: body.error || "I couldn't search my memory just now." };
+    } catch {
+      return { error: "I couldn't reach my memory just now." };
+    }
+    // found:false rides straight through. It has to stay unambiguous all the
+    // way to the model: an empty list reads as success, and the answer that
+    // produces is a confident invention about the household's own past.
+    if (!body.found) return { found: false };
+    return {
+      found: true,
+      // Spoken dates, not ISO strings — same treatment as get_calendar.
+      events: body.events.map(e => ({ when: spokenPastTime(e.at), what: e.summary || e.name })),
+    };
   },
 
   async set_volume({ level, direction }) {
@@ -1092,6 +1200,9 @@ async function startSession() {
     const tokenBody = await tokenResp.json();
     if (!tokenResp.ok) throw new Error(tokenBody.error || "Could not create session");
     const EPHEMERAL_KEY = tokenBody.value;
+    // The tail of the last conversation, if it's recent enough to still be
+    // worth replaying — the server decides that, and renders the text.
+    pendingRollover = tokenBody.rollover || null;
 
     // 2. Peer connection: mic up, assistant audio down. A text session skips
     //    getUserMedia entirely — no permission prompt, no recording indicator
@@ -1247,6 +1358,24 @@ async function onDataChannelOpen() {
     for (const r of missed) r.done = true; // stays rendered as "missed", but only announced once
     saveSchedules();
   }
+  // Where the last conversation left off (Plan 9), as one item rather than one
+  // per turn: the token budget stays in one place, and a single framed block
+  // keeps the model from adopting a replayed turn's modality.
+  const rollover = pendingRollover;
+  pendingRollover = null;
+  if (rollover?.text) {
+    sendEvent({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: ROLLOVER_ROLE,
+        content: [{
+          type: "input_text",
+          text: ROLLOVER_ROLE === "user" ? `[system event] ${rollover.text}` : rollover.text,
+        }],
+      },
+    });
+  }
   const typed = pendingTypedMessage;
   pendingTypedMessage = null;
   const reconnected = wasReconnect;
@@ -1254,6 +1383,9 @@ async function onDataChannelOpen() {
   if (typed) {
     // The user asked a question by keyboard; answering it IS the greeting.
     sendTypedMessage(typed);
+  } else if (rollover?.text) {
+    // Nova already has the context — no apology and no recap, just be ready.
+    createResponse();
   } else if (reconnected) {
     createResponse({ instructions: "Say only: 'Sorry, I lost you for a second.'" });
   } else {
@@ -1290,6 +1422,7 @@ function createResponse({ textOnly = sessionMode === "text", instructions } = {}
 function sendTypedMessage(text) {
   if (assistantSpeaking) sendEvent({ type: "response.cancel" }); // typed barge-in
   addMessage("user", text);
+  recordTurn("user", text); // no transcription event fires for typed input
   sendEvent({
     type: "conversation.item.create",
     item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
@@ -1321,6 +1454,12 @@ textForm.addEventListener("submit", (e) => {
 function teardown() {
   connected = false;
   assistantSpeaking = false;
+  // Get the tail on the server now — the next session may be seconds away.
+  if (rolloverFlushTimer) { clearTimeout(rolloverFlushTimer); rolloverFlushTimer = null; }
+  if (archiveFlushTimer) { clearTimeout(archiveFlushTimer); archiveFlushTimer = null; }
+  pendingTools = [];
+  flushRollover();
+  flushArchive();
   try { dc?.close(); } catch {}
   try { pc?.close(); } catch {}
   micStream?.getTracks().forEach(t => t.stop());
@@ -1336,6 +1475,141 @@ function stopSession(message = "Tap the ring to wake Nova") {
   if (wakeEnabled) startWakeListening();
 }
 
+// ---------- Memory archive (Plan 10, Tier C) ----------
+// An append-only record of what happened, written here and read only when the
+// model explicitly asks for it. It never enters the prompt, so it costs
+// nothing on a normal turn no matter how large it grows.
+//
+// The server sanitizes everything again on arrival; the trimming here is about
+// what is worth recording at all, not about trusting the browser.
+
+const ARCHIVE_FLUSH_MS = 5000;
+const ARCHIVE_MAX_QUEUE = 60;
+
+let archiveQueue = [];
+let archiveFlushTimer = null;
+
+function archive(event) {
+  if (!event) return;
+  archiveQueue.push(event);
+  // A wedged server must not turn into unbounded memory growth in the tab.
+  if (archiveQueue.length > ARCHIVE_MAX_QUEUE) archiveQueue = archiveQueue.slice(-ARCHIVE_MAX_QUEUE);
+  if (!archiveFlushTimer) {
+    archiveFlushTimer = setTimeout(() => { archiveFlushTimer = null; flushArchive(); }, ARCHIVE_FLUSH_MS);
+  }
+}
+
+// Fire-and-forget: a failed flush is dropped, never retried into the voice
+// path, never surfaced. History is worth less than a working conversation.
+function flushArchive() {
+  if (!archiveQueue.length) return;
+  const events = archiveQueue;
+  archiveQueue = [];
+  fetch("/api/memory/archive", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ events }),
+  }).catch(() => {});
+}
+
+// One row per tool call. Routine steps deliberately don't come through here —
+// they bypass runTool, so a routine lands as a single event with its name
+// rather than six near-identical rows that would skew every count in Tier D.
+function archiveTool(name, args, output, source = "speech") {
+  if (ARCHIVE_SKIP_TOOLS.includes(name)) return;
+  archive({
+    kind: "tool",
+    name,
+    args: redactArgs(name, args),
+    ok: !output?.error,
+    summary: summarizeToolResult(output),
+    // External wins over the caller's source: a news step inside a routine is
+    // still fetched text.
+    source: EXTERNAL_TOOLS.includes(name) ? "external" : source,
+  });
+}
+
+// ---------- Session rollover (Plan 9) ----------
+// The tail of the conversation, mirrored to the server so a brand-new session
+// — after a drop, a reload, or the Realtime API's hourly cap — can pick up
+// where this one left off. Text only: assistant audio can't be loaded back
+// into a session at all, and text costs roughly a tenth of the same audio.
+//
+// The buffer deliberately outlives a single session. A reconnect is a new
+// Realtime session but the same conversation, and the browser is the only
+// thing that sees both halves.
+
+const ROLLOVER_TURNS = 8;
+const ROLLOVER_FLUSH_MS = 5000;
+
+let turnBuffer = [];        // { role, text, tools, mode }
+let pendingTools = [];      // tools that ran while the current reply was being built
+let rolloverFlushTimer = null;
+let pendingRollover = null; // handed back by POST /api/session, injected on open
+
+// The one place that decides whether the API accepts a system-role
+// conversation item. OpenAI's own compaction cookbook uses one here, but this
+// codebase has only ever sent user-role items (see the missed-reminders block
+// in onDataChannelOpen). If the server rejects the item or the model ignores
+// it, switch this to "user" — the text is written to work either way.
+const ROLLOVER_ROLE = "system";
+
+function recordTurn(role, text) {
+  const clean = String(text || "").trim();
+  if (!clean) return;
+  // Never let a rollover open with Nova talking: the first thing she says is a
+  // greeting or a "sorry, I lost you", neither of which is worth carrying.
+  if (role === "assistant" && !turnBuffer.length) { pendingTools = []; return; }
+  const turn = {
+    role,
+    text: clean,
+    tools: role === "assistant" ? pendingTools : [],
+    mode: sessionMode,
+  };
+  turnBuffer.push(turn);
+  // Tier C keeps every turn; Tier B (turnBuffer, below) keeps only the tail.
+  // A reply built on fetched text is marked external and stays out of recall
+  // results — archived for completeness, not for reciting back.
+  archive({
+    kind: "turn",
+    name: role,
+    summary: clean,
+    source: turn.tools.some(t => EXTERNAL_TOOLS.includes(t)) ? "external" : "speech",
+  });
+  if (role === "assistant") pendingTools = [];
+  if (turnBuffer.length > ROLLOVER_TURNS) turnBuffer = turnBuffer.slice(-ROLLOVER_TURNS);
+  if (!rolloverFlushTimer) {
+    rolloverFlushTimer = setTimeout(() => { rolloverFlushTimer = null; flushRollover(); }, ROLLOVER_FLUSH_MS);
+  }
+}
+
+// Fire-and-forget: a failed flush is dropped, never retried into the voice
+// path. Debouncing is what makes this survive an *unclean* drop — by the time
+// the connection dies the server already has everything but the last few
+// seconds.
+function flushRollover() {
+  if (!turnBuffer.length) return; // never overwrite a good rollover with nothing
+  fetch("/api/memory/rollover", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ turns: turnBuffer }),
+  }).catch(() => {});
+}
+
+// A reload never reaches teardown(), and an in-flight fetch() dies with the
+// page — sendBeacon is the one request the browser promises to finish.
+addEventListener("pagehide", () => {
+  if (!navigator.sendBeacon) return;
+  const beacon = (url, payload) =>
+    navigator.sendBeacon(url, new Blob([JSON.stringify(payload)], { type: "application/json" }));
+  if (turnBuffer.length) beacon("/api/memory/rollover", { turns: turnBuffer });
+  if (archiveQueue.length) {
+    beacon("/api/memory/archive", { events: archiveQueue });
+    archiveQueue = [];
+  }
+});
+
+
 // ---------- Server event handling ----------
 
 let currentAssistantMsg = null;
@@ -1344,9 +1618,12 @@ let currentUserMsg = null;
 function handleServerEvent(evt) {
   switch (evt.type) {
     // The user's speech transcript (input side)
-    case "conversation.item.input_audio_transcription.completed":
-      addMessage("user", evt.transcript?.trim() || "…");
+    case "conversation.item.input_audio_transcription.completed": {
+      const said = evt.transcript?.trim() || "";
+      addMessage("user", said || "…");
+      recordTurn("user", said);
       break;
+    }
 
     case "input_audio_buffer.speech_started":
       if (!assistantSpeaking) setRingState("listening", "Listening…");
@@ -1362,6 +1639,7 @@ function handleServerEvent(evt) {
       break;
 
     case "response.output_audio_transcript.done":
+      recordTurn("assistant", evt.transcript);
       currentAssistantMsg = null;
       break;
 
@@ -1372,6 +1650,7 @@ function handleServerEvent(evt) {
       break;
 
     case "response.output_text.done":
+      recordTurn("assistant", evt.text);
       currentAssistantMsg = null;
       break;
 
@@ -1408,6 +1687,7 @@ async function runTool(name, callId, argsJson) {
   let args = {};
   try { args = JSON.parse(argsJson || "{}"); } catch {}
   addMessage("event", `⚙ ${name}(${summarizeArgs(args)})`);
+  pendingTools.push(name); // provenance for the rollover filter (Plan 9)
   let output;
   try {
     const handler = toolHandlers[name];
@@ -1415,6 +1695,7 @@ async function runTool(name, callId, argsJson) {
   } catch (err) {
     output = { error: String(err.message || err) };
   }
+  archiveTool(name, args, output); // Plan 10: one choke point covers every call
   sendEvent({
     type: "conversation.item.create",
     item: { type: "function_call_output", call_id: callId, output: JSON.stringify(output) },
@@ -1893,6 +2174,130 @@ function renderLists() {
     body.append(h, ul);
   }
 }
+
+// ---------- Habit suggestions (Plan 10, Tier D) ----------
+// Nova counts patterns off-session and proposes; a person here decides. This
+// card is the whole confirmation step — until someone taps Remember, a
+// suggestion is a row in a file and nothing else, and in particular it is not
+// in the system prompt.
+
+const SUGGESTION_POLL_MS = 5 * 60 * 1000; // the scan behind these runs hourly at best
+
+function renderSuggestions(suggestions = []) {
+  const card = document.getElementById("suggestionsCard");
+  const body = document.getElementById("suggestionsBody");
+  card.hidden = suggestions.length === 0;
+  body.innerHTML = "";
+  for (const suggestion of suggestions) {
+    const row = document.createElement("div");
+    row.className = "suggestion";
+
+    const text = document.createElement("p");
+    text.className = "suggestion-text";
+    text.textContent = suggestion.text;
+
+    const actions = document.createElement("div");
+    actions.className = "suggestion-actions";
+    // The support ("8 of the last 21 days") is shown rather than hidden: a
+    // suggestion the user can't check is one they can only guess about.
+    if (suggestion.support) {
+      const support = document.createElement("span");
+      support.className = "suggestion-support";
+      support.textContent = `seen ${suggestion.support}`;
+      actions.appendChild(support);
+    }
+    for (const [action, label] of [["accept", "Remember"], ["dismiss", "No thanks"]]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = action === "accept" ? "pill" : "text-button";
+      button.textContent = label;
+      button.addEventListener("click", () => onSuggestionButton(suggestion.id, action, button));
+      actions.appendChild(button);
+    }
+    row.append(text, actions);
+    body.appendChild(row);
+  }
+}
+
+// Shared by the card and by the spoken answer Nova gets after a routine —
+// both end at the same endpoint, so a habit accepted by voice and one accepted
+// by tap are the same fact with the same provenance.
+async function resolveSuggestion(id, action) {
+  try {
+    const resp = await fetch("/api/memory/suggestions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, id }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) return { error: body.error || `Memory is unavailable (HTTP ${resp.status}).` };
+    return { ok: true, ...body };
+  } catch {
+    return { error: "I can't reach my memory right now — nothing was saved." };
+  }
+}
+
+async function onSuggestionButton(id, action, button) {
+  const buttons = button?.closest(".suggestion")?.querySelectorAll("button") || [];
+  for (const b of buttons) b.disabled = true;
+  const result = await resolveSuggestion(id, action);
+  if (result.error) {
+    for (const b of buttons) b.disabled = false;
+    addMessage("event", "⚠ Couldn't save that just now.");
+    return;
+  }
+  if (action === "accept") {
+    // Facts are read at session start, so an accepted habit reaches Nova on
+    // the next connection, not this one. Say so rather than implying it's
+    // already in effect.
+    addMessage("event", "✓ Saved — Nova will know that from the next time you talk.");
+  }
+  await pollSuggestions();
+}
+
+// The one place Nova is allowed to raise a suggestion out loud: at the end of
+// a routine the user asked for. Claiming it server-side stamps it as asked, so
+// she raises each one exactly once however many routines run.
+async function claimSuggestionToAsk() {
+  try {
+    const resp = await fetch("/api/memory/suggestions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "ask" }),
+      // The morning update is not allowed to wait on this. A slow or wedged
+      // server costs the aside, not the routine.
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!resp.ok) return null;
+    return (await resp.json()).suggestion || null;
+  } catch {
+    return null; // a routine must never fail over a nicety
+  }
+}
+
+let suggestionsPollInFlight = false;
+async function pollSuggestions() {
+  if (suggestionsPollInFlight) return;
+  suggestionsPollInFlight = true;
+  try {
+    const resp = await fetch("/api/memory/suggestions");
+    if (resp.ok) renderSuggestions((await resp.json()).suggestions || []);
+  } catch {
+    // Offline is not an error worth a badge: there is nothing to act on.
+  } finally {
+    suggestionsPollInFlight = false;
+  }
+}
+// Only the timer is gated on visibility. The load-time fetch is not: a tab
+// that starts hidden — an installed PWA resuming, a preloaded page — would
+// otherwise show an empty card until the next tick five minutes later.
+setInterval(() => {
+  if (document.visibilityState === "visible") pollSuggestions();
+}, SUGGESTION_POLL_MS);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") pollSuggestions();
+});
+pollSuggestions();
 
 function renderDevices() {
   const body = document.getElementById("devicesBody");
