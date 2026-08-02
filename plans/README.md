@@ -18,6 +18,13 @@ parallel.
 | 9 | [Persistent memory: profile facts & session rollover](09-persistent-memory.md) | 2, 3, 5 | L |
 | 10 | [Memory archive & learned habits](10-memory-archive-and-habits.md) | 9, 3, 4 (soft) | L |
 
+Plan 7's calendar has since grown a write half. The ICS reader it shipped with
+stays exactly as specified — a subscription feed is GET-only, so no amount of
+work on `lib/ics.js` could ever create an event — and writes go to Google
+Calendar over OAuth instead (`lib/gcal.js`, `GOOGLE_CLIENT_ID`/`SECRET`). Reads
+merge both sources and dedupe; routines may read the calendar but are never
+allowed to write to it.
+
 Plans 9 and 10 are shipped. Two of plan 10's "Before you start" questions can
 only be answered by a household that has been running it for a while, so the
 code reports them instead of assuming: the boot log prints the archive's size

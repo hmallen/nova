@@ -162,12 +162,16 @@ async function geocodeCity(location) {
 // ---------- Integration config (Plan 7) ----------
 // Fetched once at boot, before any session starts: the model should only be
 // told about devices/calendar/radio that actually exist.
-let appConfig = { homeAssistant: false, calendar: false, radio: [] };
+let appConfig = { homeAssistant: false, calendar: false, calendarWritable: false, googleConfigured: false, radio: [] };
+// event_ref → Google event id, re-seeded on every get_calendar. Writes are
+// addressed by ref so the model never has to repeat an opaque id back.
+let calendarRefs = new Map();
 const configReady = fetch("/api/config")
   .then(r => (r.ok ? r.json() : appConfig))
   .then(c => {
-    appConfig = { homeAssistant: false, calendar: false, radio: [], ...c };
+    appConfig = { homeAssistant: false, calendar: false, calendarWritable: false, googleConfigured: false, radio: [], ...c };
     if (appConfig.homeAssistant) initHaDevices();
+    initCalendarCard();
     if (appConfig.calendar) {
       ROUTINE_ALLOWED_TOOLS.push("get_calendar");
       // The default morning routine gains the calendar when one exists.
@@ -471,13 +475,69 @@ function buildTools() {
     tools.push({
       type: "function",
       name: "get_calendar",
-      description: "Get the user's calendar events for today or the next few days.",
+      description: "Get the user's calendar events for today or the next few days. " +
+        "Each event comes back with an event_ref you can pass to " +
+        "update_calendar_event or cancel_calendar_event.",
       parameters: {
         type: "object",
         properties: {
           days: { type: "number", description: "1=today (default), up to 7" },
         },
         required: [],
+      },
+    });
+  }
+  if (appConfig.calendarWritable) {
+    tools.push({
+      type: "function",
+      name: "create_calendar_event",
+      description: "Add an event to the user's calendar. Resolve relative phrases " +
+        "('tomorrow at 3', 'next Tuesday morning') to an absolute local datetime " +
+        "yourself; call get_current_datetime first if you don't know the current " +
+        "date. If the user didn't say how long it lasts, leave the duration out.",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string", description: "Event title, as the user said it: 'dentist'" },
+          start: { type: "string", description: "Local datetime YYYY-MM-DDTHH:MM, or YYYY-MM-DD when all_day" },
+          end: { type: "string", description: "Optional local end datetime; omit to use duration_minutes" },
+          duration_minutes: { type: "number", description: "Length in minutes when no end is given. Default 60." },
+          all_day: { type: "boolean", description: "True for a whole-day event with no clock time" },
+          location: { type: "string", description: "Optional place" },
+        },
+        required: ["summary", "start"],
+      },
+    });
+    tools.push({
+      type: "function",
+      name: "update_calendar_event",
+      description: "Change the time or title of an existing event. Call get_calendar " +
+        "first to get its event_ref. Only include the fields that change.",
+      parameters: {
+        type: "object",
+        properties: {
+          event_ref: { type: "number", description: "The event_ref from get_calendar" },
+          summary: { type: "string", description: "New title" },
+          start: { type: "string", description: "New local start datetime YYYY-MM-DDTHH:MM" },
+          end: { type: "string", description: "New local end datetime" },
+          duration_minutes: { type: "number", description: "New length in minutes" },
+          location: { type: "string" },
+        },
+        required: ["event_ref"],
+      },
+    });
+    tools.push({
+      type: "function",
+      name: "cancel_calendar_event",
+      description: "Delete an event from the calendar. Call get_calendar first to get " +
+        "its event_ref. Only call this once the user has confirmed they mean to " +
+        "cancel that specific event — it cannot be undone.",
+      parameters: {
+        type: "object",
+        properties: {
+          event_ref: { type: "number", description: "The event_ref from get_calendar" },
+        },
+        required: ["event_ref"],
       },
     });
   }
@@ -762,17 +822,86 @@ const toolHandlers = {
       const body = await resp.json();
       if (!resp.ok) return { error: body.error || "Couldn't read the calendar right now." };
       // Speak times, not ISO strings — keep the model away from raw dates.
-      const events = body.events.map(e => {
+      // Google's event ids are opaque 26-character strings; a small integer
+      // ref survives a voice model's working memory intact, and the mapping
+      // is re-seeded on every read so a stale ref can't point at the wrong
+      // event later.
+      calendarRefs = new Map();
+      const events = body.events.map((e, i) => {
         const start = new Date(e.start_iso);
         const day = start.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+        const ref = i + 1;
+        if (e.id) calendarRefs.set(ref, e.id);
         return {
+          ...(e.id ? { event_ref: ref } : {}),
           summary: e.summary,
           when: e.all_day ? `${day} (all day)` : `${day} at ${start.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`,
+          ...(e.source === "ics" ? { read_only: true } : {}),
         };
       });
+      renderCalendar(body.events);
       return { events, ...(body.note ? { note: body.note } : {}) };
     } catch {
       return { error: "Couldn't read the calendar right now." };
+    }
+  },
+
+  async create_calendar_event({ summary, start, end, duration_minutes, all_day, location }) {
+    if (!summary) return { error: "An event needs a title." };
+    const shape = all_day ? /^\d{4}-\d{2}-\d{2}$/ : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
+    if (!shape.test(start || "")) {
+      return { error: all_day
+        ? "start must be a date like 2026-08-05."
+        : "start must be a local datetime like 2026-08-05T15:00." };
+    }
+    try {
+      const resp = await fetch("/api/calendar/events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          summary, start, end, duration_minutes, all_day, location,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        }),
+      });
+      const body = await resp.json();
+      if (!resp.ok) return { error: body.error || "Couldn't add that to the calendar." };
+      refreshCalendarCard();
+      return { ok: true, summary: body.event.summary, when: spokenEventTime(body.event) };
+    } catch {
+      return { error: "Couldn't reach the calendar right now." };
+    }
+  },
+
+  async update_calendar_event({ event_ref, ...patch }) {
+    const id = calendarRefs.get(Math.round(event_ref));
+    if (!id) return { error: "I don't have that event — read the calendar first." };
+    try {
+      const resp = await fetch(`/api/calendar/events/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...patch, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
+      });
+      const body = await resp.json();
+      if (!resp.ok) return { error: body.error || "Couldn't change that event." };
+      refreshCalendarCard();
+      return { ok: true, summary: body.event.summary, when: spokenEventTime(body.event) };
+    } catch {
+      return { error: "Couldn't reach the calendar right now." };
+    }
+  },
+
+  async cancel_calendar_event({ event_ref }) {
+    const id = calendarRefs.get(Math.round(event_ref));
+    if (!id) return { error: "I don't have that event — read the calendar first." };
+    try {
+      const resp = await fetch(`/api/calendar/events/${encodeURIComponent(id)}`, { method: "DELETE" });
+      const body = await resp.json();
+      if (!resp.ok) return { error: body.error || "Couldn't cancel that event." };
+      calendarRefs.delete(Math.round(event_ref)); // one cancellation per ref
+      refreshCalendarCard();
+      return { ok: true, cancelled: body.summary || "that event" };
+    } catch {
+      return { error: "Couldn't reach the calendar right now." };
     }
   },
 
@@ -2173,6 +2302,68 @@ function renderLists() {
     }
     body.append(h, ul);
   }
+}
+
+// ---------- Calendar card ----------
+// The card exists to make writes visible: an event Nova created by voice
+// should be something you can see it got right, without opening Google.
+
+function spokenEventTime(event) {
+  const start = new Date(event.start_iso);
+  const day = start.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+  return event.all_day
+    ? `${day} (all day)`
+    : `${day} at ${start.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+}
+
+function initCalendarCard() {
+  const card = document.getElementById("calendarCard");
+  if (!card) return;
+  const connect = document.getElementById("calendarConnect");
+  // Offer the connect link only when the server has credentials to use it.
+  connect.hidden = !(appConfig.googleConfigured && !appConfig.calendarWritable);
+  card.hidden = !appConfig.calendar && connect.hidden;
+  if (appConfig.calendar) refreshCalendarCard();
+}
+
+async function refreshCalendarCard() {
+  if (!appConfig.calendar) return;
+  try {
+    const resp = await fetch("/api/calendar?days=7");
+    if (!resp.ok) return;
+    const body = await resp.json();
+    renderCalendar(body.events || []);
+  } catch {
+    // A card that fails to refresh is not worth interrupting anyone over.
+  }
+}
+
+function renderCalendar(events = []) {
+  const card = document.getElementById("calendarCard");
+  const body = document.getElementById("calendarBody");
+  if (!card || !body) return;
+  card.hidden = false;
+  body.innerHTML = "";
+  if (!events.length) {
+    const empty = document.createElement("p");
+    empty.className = "devices-empty";
+    empty.textContent = "Nothing on the calendar for the next week.";
+    body.appendChild(empty);
+    return;
+  }
+  const ul = document.createElement("ul");
+  ul.className = "list-items";
+  for (const e of events.slice(0, 8)) {
+    const li = document.createElement("li");
+    const title = document.createElement("span");
+    title.textContent = e.summary;
+    const when = document.createElement("span");
+    when.className = "timer-time";
+    when.textContent = spokenEventTime(e);
+    li.append(title, when);
+    ul.appendChild(li);
+  }
+  body.appendChild(ul);
 }
 
 // ---------- Habit suggestions (Plan 10, Tier D) ----------

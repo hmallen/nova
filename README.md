@@ -31,6 +31,9 @@ Try:
 - "Turn on the living room light" · "Turn off all the lights" · "Set the thermostat to 72"
 - "Play rain sounds" / "Play ocean sounds" · "Play some jazz" (internet radio) · "Stop"
 - "What's on my calendar today?" (with `ICS_URL` configured)
+- "Put dentist on the calendar for Thursday at two thirty" · "Move my three
+  o'clock to four" · "Cancel the dentist appointment" (with Google Calendar
+  connected — see Calendar below)
 - "Turn the volume down"
 - "Good morning" — runs a routine: weather, today's schedule, and a short
   news briefing as one flowing update ("Good night" ends with rain sounds)
@@ -173,16 +176,60 @@ Light brightness is out of scope for now: Nova says she can only switch
 lights on and off. Without the env vars, devices stay simulated exactly as
 before and can be pinned the same way.
 
-### Calendar (read-only ICS)
+### Calendar
 
-Set `ICS_URL` to a private iCal feed URL (Google: calendar settings → "Secret
-address in iCal format"; Outlook: "Publish calendar" ICS link; iCloud: public
-calendar link). "What's on my calendar today?" reads upcoming events with a
-hand-rolled RFC 5545 parser supporting TZID zones, all-day events, and
-daily/weekly RRULEs (weekly meetings — the 90% case). Other recurrence forms
-are skipped and Nova mentions some repeating events couldn't be read. The
-feed is cached for 15 minutes. When configured, the "good morning" routine
-gains a calendar step automatically.
+The calendar has two halves, and they answer different questions.
+
+**Reading a subscribed feed (`ICS_URL`).** Set it to a private iCal feed URL
+(Google: calendar settings → "Secret address in iCal format"; Outlook:
+"Publish calendar" ICS link; iCloud: public calendar link). "What's on my
+calendar today?" reads upcoming events with a hand-rolled RFC 5545 parser
+supporting TZID zones, all-day events, and daily/weekly RRULEs (weekly
+meetings — the 90% case). Other recurrence forms are skipped and Nova
+mentions some repeating events couldn't be read. The feed is cached for 15
+minutes. This half is **read-only and always will be**: a subscription feed is
+served over HTTP GET, and there is no request you can make to it that creates
+an event.
+
+**Reading and writing Google Calendar (`GOOGLE_CLIENT_ID` /
+`GOOGLE_CLIENT_SECRET`).** Connect Google and Nova can also *create* events:
+
+- "Put dentist on the calendar for Thursday at two thirty"
+- "Add a lunch with Sam next Tuesday at noon for an hour"
+- "Block out Friday for the trip" (all-day)
+- "Move my three o'clock to four" · "Cancel the dentist appointment"
+
+One-time setup:
+
+1. In [console.cloud.google.com](https://console.cloud.google.com), create a
+   project and enable the **Google Calendar API**.
+2. APIs & Services → Credentials → **Create OAuth client ID** → *Web
+   application*. Add `http://localhost:3000/api/google/callback` as an
+   authorized redirect URI (match the host and port you actually use).
+3. Put the client id and secret in `.env`, restart Nova, and open
+   `http://localhost:3000/api/google/auth` — or click **Connect Google
+   Calendar** on the Calendar card. Approve once.
+
+Nova asks for the `calendar.events` scope only, so it can manage events and
+nothing else — no creating calendars, no reading sharing settings. The refresh
+token is stored server-side in `data/google.json` (gitignored) and never
+reaches the browser; `/api/config` reports only whether a connection exists.
+Disconnect at any time with `POST /api/google/disconnect`, which also revokes
+the grant upstream.
+
+When both are configured, reads merge the two and drop duplicates (pointing
+`ICS_URL` at the same calendar Google is already serving is a common setup);
+writes always go to Google, since nothing else here can accept them. If Google
+is unreachable, a configured ICS feed still answers and Nova says the rest
+couldn't be reached.
+
+Voice writes are guarded the way an irreversible action should be: the model
+confirms the title and time back to you when creating, and is instructed to
+name the specific event and get a clear yes before cancelling one. Events
+Nova creates or cancels are recorded in the memory archive, so "when did I put
+that on the calendar?" has an answer. When a calendar is configured, the "good
+morning" routine gains a calendar step automatically — routines can read the
+calendar but are never allowed to write to it.
 
 ### Internet radio
 
